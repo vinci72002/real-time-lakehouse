@@ -1,14 +1,12 @@
 """
-飞机传感器 Telemetry Producer
-============================
+Aircraft telemetry producer.
 
-模拟 3 架飞机持续产生传感器 JSON，并滚动打印到终端。
+Simulates three aircraft and prints each sensor event as it is emitted.
 
-关键机制:
-  - 每 0.5 秒产出一条事件（可配置）
-  - 约 5% 注入异常: 乱序时间戳 (Out-of-order) 或重复 event_id
-  - 少量脏数据: engine_temp > 1000，供下游 Flink 清洗演示
-  - 同时写入本地 JSONL；若 Kafka 可用则一并投递
+- One event every 0.5 seconds (configurable)
+- About 5% of events are late (timestamp shifted back) or reuse an event_id
+- About 3% set engine_temp above 1000 so the downstream job can reject them
+- Writes a local JSONL file, and also publishes to Kafka when it is reachable
 """
 
 from __future__ import annotations
@@ -36,7 +34,7 @@ from rich.text import Text
 
 
 def _configure_stdio() -> None:
-    """Windows GBK 控制台无法打印部分 Unicode，统一切到 UTF-8。"""
+    """Windows consoles default to a legacy code page. Force UTF-8."""
     for stream in (sys.stdout, sys.stderr):
         reconfigure = getattr(stream, "reconfigure", None)
         if callable(reconfigure):
@@ -46,7 +44,7 @@ def _configure_stdio() -> None:
 _configure_stdio()
 
 # ---------------------------------------------------------------------------
-# 常量
+# Constants
 # ---------------------------------------------------------------------------
 
 AIRCRAFT_IDS = ("AC-101", "AC-102", "AC-103")
@@ -79,20 +77,20 @@ console = Console(theme=THEME, highlight=False, legacy_windows=False)
 
 
 # ---------------------------------------------------------------------------
-# 数据模型
+# Models
 # ---------------------------------------------------------------------------
 
 
 class Telemetry(BaseModel):
-    """单条传感器读数。"""
+    """One sensor sample."""
 
-    altitude: float = Field(..., description="飞行高度，单位米")
-    speed: float = Field(..., description="真空速，单位 km/h")
-    engine_temp: float = Field(..., description="发动机排气温度，单位摄氏度")
+    altitude: float = Field(..., description="Altitude in meters")
+    speed: float = Field(..., description="True airspeed in km/h")
+    engine_temp: float = Field(..., description="Exhaust gas temperature in Celsius")
 
 
 class AircraftEvent(BaseModel):
-    """Kafka / JSONL 上的标准事件信封。"""
+    """Event envelope written to Kafka and the local JSONL file."""
 
     event_id: str
     aircraft_id: str
@@ -100,12 +98,12 @@ class AircraftEvent(BaseModel):
     telemetry: Telemetry
     anomaly: Optional[str] = Field(
         default=None,
-        description="演示标记: late / duplicate / overheat，生产环境可省略",
+        description="Demo tag: late, duplicate, or overheat. Omit in production.",
     )
 
 
 # ---------------------------------------------------------------------------
-# 飞机飞行状态（随机游走，让曲线看起来像真实巡航）
+# Flight state. A small random walk so the series looks like cruise.
 # ---------------------------------------------------------------------------
 
 
@@ -119,7 +117,7 @@ class AircraftState:
     emitted: int = 0
 
     def tick(self) -> Telemetry:
-        """让高度 / 速度 / 温度做小幅随机游走，并夹在合理区间内。"""
+        """Nudge altitude, speed, and temperature, and keep them in range."""
         self.altitude = _clamp(self.altitude + random.uniform(-80, 80), 8_800, 12_200)
         self.speed = _clamp(self.speed + random.uniform(-12, 12), 720, 920)
         self.engine_temp = _clamp(self.engine_temp + random.uniform(-8, 8), 520, 860)
@@ -136,7 +134,7 @@ def _clamp(value: float, low: float, high: float) -> float:
 
 
 def _fleet() -> list[AircraftState]:
-    """三架飞机的初始巡航剖面略有差异，方便录屏时一眼区分。"""
+    """Three slightly different cruise profiles so the aircraft are easy to tell apart."""
     return [
         AircraftState("AC-101", altitude=10_800, speed=860, engine_temp=690),
         AircraftState("AC-102", altitude=10_200, speed=820, engine_temp=640),
@@ -145,12 +143,12 @@ def _fleet() -> list[AircraftState]:
 
 
 # ---------------------------------------------------------------------------
-# Kafka（可选）
+# Kafka, optional
 # ---------------------------------------------------------------------------
 
 
 class OptionalKafka:
-    """Kafka 可用则发送，不可用则静默降级，保证单机 Demo 仍能跑。"""
+    """Publish when Kafka is up. Otherwise keep the local demo running."""
 
     def __init__(self, bootstrap: str, topic: str) -> None:
         self.bootstrap = bootstrap
@@ -164,7 +162,7 @@ class OptionalKafka:
         try:
             from kafka import KafkaProducer  # type: ignore
         except ImportError:
-            console.print("[dim]kafka-python 未安装，仅本地 JSONL + 控制台输出[/]")
+            console.print("[dim]kafka-python is not installed; writing JSONL and console output only[/]")
             return
 
         try:
@@ -178,14 +176,14 @@ class OptionalKafka:
                 max_block_ms=2_000,
                 api_version=(2, 8, 0),
             )
-            # 一次 metadata 探测，避免“假连接”
+            # One metadata lookup so a half-open connection is not treated as success.
             self.producer.partitions_for(self.topic)
             self.ok = True
         except Exception as exc:  # noqa: BLE001
             self.producer = None
             self.ok = False
-            console.print(f"[dim]Kafka 不可用 ({self.bootstrap}): {exc}[/]")
-            console.print("[dim]已降级为本地 JSONL，Flink 作业会自动 tail 该文件[/]")
+            console.print(f"[dim]Kafka unavailable ({self.bootstrap}): {exc}[/]")
+            console.print("[dim]Falling back to local JSONL. The simulated job tails that file.[/]")
 
     def send(self, event: AircraftEvent) -> None:
         if not self.ok or self.producer is None:
@@ -211,7 +209,7 @@ class OptionalKafka:
 
 
 # ---------------------------------------------------------------------------
-# 事件工厂
+# Event factory
 # ---------------------------------------------------------------------------
 
 
@@ -232,8 +230,8 @@ def build_event(
     stats: GeneratorStats,
 ) -> AircraftEvent:
     """
-    生成一条事件。约 anomaly_rate 的概率注入乱序或重复，
-    另有 hot_rate 的概率把发动机温度拉到脏数据区间。
+    Build one event. With probability anomaly_rate, make it late or a duplicate.
+    Independently, with probability hot_rate, push engine temperature out of range.
     """
     now = datetime.now(timezone.utc)
     telemetry = aircraft.tick()
@@ -242,13 +240,13 @@ def build_event(
 
     roll = random.random()
     if roll < anomaly_rate:
-        # 一半乱序、一半重复（重复需要已有历史 event_id）
+        # Half late, half duplicate. A duplicate needs a previous event_id.
         if aircraft.last_event_id and random.random() < 0.5:
             event_id = aircraft.last_event_id
             anomaly = "duplicate"
             stats.duplicate += 1
         else:
-            # 回拨 8~25 秒，超过 Flink 默认 5s watermark，必被识别为乱序
+            # Shift the timestamp back 8–25s, past the 5s watermark.
             delay = random.uniform(8, 25)
             now = now - timedelta(seconds=delay)
             anomaly = "late"
@@ -277,24 +275,24 @@ def build_event(
 
 
 # ---------------------------------------------------------------------------
-# 漂亮的控制台输出（方便 OBS 录屏）
+# Console output
 # ---------------------------------------------------------------------------
 
 
 def print_banner(interval: float, kafka: OptionalKafka) -> None:
-    sink = "Kafka + JSONL" if kafka.ok else "本地 JSONL（Kafka 离线）"
+    sink = "Kafka + JSONL" if kafka.ok else "local JSONL (Kafka offline)"
     body = Text.from_markup(
-        "[banner]飞机传感器实时数据 Lakehouse  ·  Producer[/]\n"
+        "[banner]Aircraft telemetry lakehouse  ·  Producer[/]\n"
         f"[dim]fleet[/]  AC-101   AC-102   AC-103\n"
-        f"[dim]rate[/]   每 [stat]{interval:.1f}s[/] 一条   "
-        f"[dim]anomaly[/]  5% 乱序/重复   [dim]dirty[/]  3% 超温\n"
+        f"[dim]rate[/]   one event every [stat]{interval:.1f}s[/]   "
+        f"[dim]anomaly[/]  5% late/duplicate   [dim]dirty[/]  3% overheat\n"
         f"[dim]sink[/]   {sink}   [dim]topic[/]  {KAFKA_TOPIC}"
     )
     console.print(
         Panel(
             body,
             title="[ok]>> TELEMETRY PRODUCER[/]",
-            subtitle="[dim]Ctrl+C 停止[/]",
+            subtitle="[dim]Ctrl+C to stop[/]",
             border_style="bright_cyan",
             box=box.DOUBLE,
             padding=(1, 2),
@@ -339,7 +337,7 @@ def print_event(event: AircraftEvent) -> None:
         line.append(f"   event_time={event_ts}", style="late")
     console.print(line)
 
-    # 紧凑 JSON，OBS 里能看清完整 payload
+    # Compact JSON so the full payload fits on one line.
     payload = event.model_dump(exclude_none=True)
     console.print(f"   [dim]{json.dumps(payload, ensure_ascii=False)}[/]")
 
@@ -368,13 +366,13 @@ def print_stats(stats: GeneratorStats, kafka: OptionalKafka) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 主循环
+# Main loop
 # ---------------------------------------------------------------------------
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="飞机传感器 Telemetry Producer")
-    parser.add_argument("--interval", type=float, default=DEFAULT_INTERVAL, help="发送间隔（秒）")
+    parser = argparse.ArgumentParser(description="Aircraft telemetry producer")
+    parser.add_argument("--interval", type=float, default=DEFAULT_INTERVAL, help="Seconds between events")
     parser.add_argument("--anomaly-rate", type=float, default=DEFAULT_ANOMALY_RATE)
     parser.add_argument("--hot-rate", type=float, default=DEFAULT_HOT_RATE)
     parser.add_argument(
@@ -382,8 +380,8 @@ def parse_args() -> argparse.Namespace:
         default=os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092"),
         help="Kafka bootstrap servers",
     )
-    parser.add_argument("--no-kafka", action="store_true", help="强制不连接 Kafka")
-    parser.add_argument("--jsonl", type=Path, default=LOCAL_SINK, help="本地 JSONL 路径")
+    parser.add_argument("--no-kafka", action="store_true", help="Do not connect to Kafka")
+    parser.add_argument("--jsonl", type=Path, default=LOCAL_SINK, help="Local JSONL path")
     return parser.parse_args()
 
 

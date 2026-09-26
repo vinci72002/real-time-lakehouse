@@ -1,37 +1,68 @@
-# 飞机传感器实时数据 Lakehouse（MVP）
+# Aircraft Telemetry Lakehouse
 
-用最小可运行代码演示一条真实的实时数仓链路：
+A streaming lakehouse for aircraft sensor events. A Python producer writes telemetry to Kafka. A Flink SQL job applies event-time watermarks, drops invalid and overheated readings, keeps the first copy of each `event_id`, and commits the result to Apache Iceberg. Rows that do not belong in the main table are stored separately, with a reason and the source Kafka offset.
 
-```
-Python Producer  →  Kafka / 本地 JSONL  →  Flink 模拟作业  →  Iceberg 目录
-     3 架飞机           乱序 / 重复 / 超温           Watermark · Dedup · Clean
-```
-
-本仓库是 **可录屏的本地 Demo**：不依赖 Flink / Spark 集群也能跑通核心语义。Kafka 只是加分项，没起来时自动降级到文件总线。
-
-## 项目结构
+The same watermark, dedup, and temperature rules are also implemented in pure Python, so the processing semantics can be demonstrated without a cluster.
 
 ```
-├── data_generator.py      # 飞机 Telemetry Producer（彩色滚动日志）
-├── flink_job.py           # Watermark / 去重 / 清洗 + Iceberg sink 模拟
+producer  →  Kafka topic aircraft-telemetry  →  Flink SQL  →  Iceberg
+  3 aircraft     late / duplicate / overheat       watermark · dedup · clean
+                                                         │
+                                         aircraft_telemetry
+                                         aircraft_telemetry_rejected
+```
+
+## What this shows
+
+- Event time with a 5-second watermark, and a 15-second lateness bound
+- Exactly-once Iceberg commits on Flink checkpoints (RocksDB, 30-second interval)
+- Append-only deduplication by `event_id`, with later copies routed to a reject table
+- A reject table that records why a row was excluded and which Kafka offset it came from
+- One Iceberg REST catalog read by Flink as `lakehouse` and by Spark as `demo`
+
+## Pipeline
+
+| Condition | Where it goes |
+| --- | --- |
+| Valid reading, first time this `event_id` is seen | `aviation.aircraft_telemetry` |
+| Same `event_id` seen again within the 1-hour state TTL | `aviation.aircraft_telemetry_rejected`, `reason = duplicate` |
+| `engine_temp > 1000` | rejected, `reason = overheat` |
+| Event time is more than 15 seconds behind the watermark | rejected, `reason = too_late` |
+| Event time is late but still inside 15 seconds | main table, `late = true` |
+| Blank `event_id`, or missing aircraft, time, or temperature | rejected, `reason = blank_event_id` or `missing_*` |
+
+Several problems on one row are joined with commas, for example `overheat,too_late`. Dedup state expires after one hour, so an `event_id` older than that is treated as new.
+
+`event_time` is taken from the JSON field `timestamp`. Flink parses it as ISO-8601 with millisecond precision and a `Z` suffix, such as `2026-09-26T06:43:24.565Z`. Other shapes, including `+00:00` or six fractional digits, become null and are rejected as `missing_event_time`.
+
+Iceberg makes a snapshot visible only after a successful checkpoint, so a new row can take about 30 seconds to show up in Spark.
+
+## Layout
+
+```
+├── data_generator.py     # continuous producer for 3 aircraft
+├── flink_job.py          # local simulation of watermark, dedup, and cleaning
+├── flink_job.sql         # Flink SQL job: Kafka → Iceberg
+├── send_test_event.py    # one Kafka message for a chosen scenario
+├── submit_flink_job.ps1  # cancel the running job and submit flink_job.sql
 ├── requirements.txt
 └── README.md
 ```
 
-运行后会自动生成（已在 `.gitignore` 中）：
+Generated locally and gitignored:
 
 ```
 data/telemetry.jsonl
 warehouse/iceberg/db/aircraft_telemetry/data.jsonl
 ```
 
-## 事件 Schema
+## Event
 
 ```json
 {
-  "event_id": "7c2e0d2a-...",
+  "event_id": "7c2e0d2a-4f1b-4c0a-9a11-0b5e2d8c6f10",
   "aircraft_id": "AC-101",
-  "timestamp": "2026-09-25T15:01:03.204Z",
+  "timestamp": "2026-09-26T06:43:24.565Z",
   "telemetry": {
     "altitude": 10821.4,
     "speed": 854.2,
@@ -40,28 +71,25 @@ warehouse/iceberg/db/aircraft_telemetry/data.jsonl
 }
 ```
 
-Producer 会以约 **5%** 概率注入：
+The producer injects faults so the job has something to reject:
 
-| 异常 | 含义 | 下游表现 |
+| Fault | What is sent | Rate |
 | --- | --- | --- |
-| `late` | 时间戳回拨 8~25 秒 | `[FLINK-WATERMARK]` 识别乱序并纠正 / 丢弃过晚事件 |
-| `duplicate` | 复用上一条 `event_id` | `[FLINK-DEDUP] Dropped duplicate event_id` |
-| `overheat` | `engine_temp > 1000` | `[FLINK-CLEAN]` 拦截脏数据 |
+| `late` | timestamp moved back 8–25 seconds | about half of the 5% anomaly budget |
+| `duplicate` | previous `event_id` reused | the other half of that budget |
+| `overheat` | `engine_temp` between 1050 and 1280 | 3% |
 
-## 快速开始
+## Run the local simulation
+
+No Kafka, Flink, or Spark required.
 
 ```powershell
 python -m pip install -r requirements.txt
+python data_generator.py --no-kafka
+python flink_job.py --source file
 ```
 
-开两个终端：
-
-```powershell
-python data_generator.py
-python flink_job.py
-```
-
-`data_generator.py` 每 0.5 秒打印一条带颜色的传感器日志；`flink_job.py` 会 tail 同一份 `data/telemetry.jsonl`，并打印：
+`data_generator.py` prints one colored sensor line every 0.5 seconds and appends JSONL under `data/`. `flink_job.py` tails that file and prints:
 
 ```
 [FLINK-WATERMARK] Reordered late event ...
@@ -70,33 +98,58 @@ python flink_job.py
 [FLINK-SINK] Written to Iceberg: db.aircraft_telemetry ...
 ```
 
-## 基础设施（可选）
-
-Kafka / Flink / Iceberg 使用本机共享的 `E:\project2608\platform-infra`，本项目不再自带 compose：
-
-```powershell
-cd E:\project2608\platform-infra
-.\infra.ps1 up lakehouse-demo      # messaging + stream + lakehouse
-```
-
-两个脚本默认连接 `localhost:9092`，topic 为 `aircraft-telemetry`。Kafka 不通时自动走本地 JSONL，无需改代码。
-
-```powershell
-$env:KAFKA_BOOTSTRAP_SERVERS = "localhost:9092"
-python data_generator.py
-python flink_job.py --source kafka
-```
-
-## 常用参数
+The local job drops rejects instead of writing a second table. The reject table exists only in the Flink SQL job.
 
 ```powershell
 python data_generator.py --interval 0.5 --anomaly-rate 0.05 --hot-rate 0.03
 python flink_job.py --ooo 5 --lateness 15 --temp-limit 1000
 ```
 
-## 处理语义（对应真实 Flink）
+If Kafka is reachable at `localhost:9092`, the producer also publishes to `aircraft-telemetry`. If it is not, the producer keeps writing JSONL.
 
-1. **Watermark**：`watermark = max(event_time) - 5s`。迟到但未超过 15s allowed lateness 的事件会被重排后放行；更晚的直接丢弃。
-2. **Deduplication**：按 `event_id` LRU 去重（缓存 2000 条）。
-3. **Clean**：`engine_temp > 1000` 视为传感器脏数据，不入湖。
-4. **Sink**：追加写入本地 Iceberg-style 目录，便于后续接 Spark / 真 Iceberg catalog。
+## Run the Flink SQL job
+
+`flink_job.sql` expects these services on one Docker network:
+
+| Service | Address used by the job |
+| --- | --- |
+| Kafka | `kafka:19092`, topic `aircraft-telemetry` |
+| Flink 1.19 SQL client | JobManager container `flink-jobmanager`, UI at `http://localhost:8081` |
+| Iceberg REST catalog | `http://iceberg-rest:8181`, warehouse `s3://warehouse/` |
+| MinIO | `http://minio:9000` |
+| Spark SQL | container `spark-iceberg`, catalog name `demo` |
+
+Flink needs the Kafka SQL connector and the Iceberg Flink runtime (plus the AWS bundle for S3FileIO) on the classpath. Spark's `demo` catalog and Flink's `lakehouse` catalog must both point at that REST catalog. The MinIO user and password in `flink_job.sql` are the local demo values `admin` / `password`.
+
+Submit, replacing any running job of the same name. This cancels the old job and does not restore its savepoint, so dedup state starts empty. Kafka offsets still resume from the consumer group `lakehouse-flink-telemetry`.
+
+```powershell
+.\submit_flink_job.ps1
+```
+
+Send one message:
+
+```powershell
+python send_test_event.py normal
+python send_test_event.py duplicate
+python send_test_event.py overheat
+python send_test_event.py watermark
+python send_test_event.py too_late
+```
+
+`duplicate` reuses `TEST-NORMAL-001`, so send `normal` first. `too_late` is five minutes behind the clock; send `watermark` first so the watermark moves ahead of it. Wait for the next checkpoint before querying.
+
+```powershell
+docker exec spark-iceberg spark-sql -e "SELECT * FROM demo.aviation.aircraft_telemetry WHERE event_id = 'TEST-NORMAL-001'"
+docker exec spark-iceberg spark-sql -e "SELECT event_id, reason, kafka_offset FROM demo.aviation.aircraft_telemetry_rejected LIMIT 20"
+```
+
+In Spark the tables are `demo.aviation.aircraft_telemetry` and `demo.aviation.aircraft_telemetry_rejected`. In Flink they are `lakehouse.aviation.*`. Both names are the same Iceberg tables.
+
+## Stack
+
+- Python 3, `pydantic`, `rich`, `kafka-python`
+- Apache Kafka
+- Apache Flink 1.19 (SQL, RocksDB, exactly-once checkpoints)
+- Apache Iceberg (format v2, Parquet, zstd) on a REST catalog and MinIO
+- Apache Spark for read queries

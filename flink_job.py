@@ -1,15 +1,15 @@
 """
-PyFlink Core 逻辑模拟作业
-========================
+Local stand-in for the Flink SQL job.
 
-不依赖真实 Flink 集群，在纯 Python 中复现三条关键算子，方便本地 / OBS Demo:
+Replays the three operators in pure Python, with no Flink cluster:
 
-  1. Watermark / 乱序处理  — 识别 event-time 落后于 watermark 的迟到数据
-  2. Deduplication         — 按 event_id 去重
-  3. 数据清洗              — 拦截 engine_temp > 1000 的脏数据
+  1. Watermark     — flag event time that falls behind the watermark
+  2. Dedup         — keep the first copy of each event_id
+  3. Clean         — drop engine_temp above 1000
 
-Source 优先级: Kafka → 本地 JSONL（由 data_generator.py 写入）
-Sink   模拟写入 Iceberg 表: warehouse/iceberg/db/aircraft_telemetry/
+Source order: Kafka, then the local JSONL file written by data_generator.py.
+Sink: append-only file laid out like an Iceberg table,
+warehouse/iceberg/db/aircraft_telemetry/.
 """
 
 from __future__ import annotations
@@ -35,7 +35,7 @@ from rich.theme import Theme
 
 
 def _configure_stdio() -> None:
-    """Windows GBK 控制台无法打印部分 Unicode，统一切到 UTF-8。"""
+    """Windows consoles default to a legacy code page. Force UTF-8."""
     for stream in (sys.stdout, sys.stderr):
         reconfigure = getattr(stream, "reconfigure", None)
         if callable(reconfigure):
@@ -45,7 +45,7 @@ def _configure_stdio() -> None:
 _configure_stdio()
 
 # ---------------------------------------------------------------------------
-# 常量
+# Constants
 # ---------------------------------------------------------------------------
 
 KAFKA_TOPIC = "aircraft-telemetry"
@@ -73,7 +73,7 @@ console = Console(theme=THEME, highlight=False, legacy_windows=False)
 
 
 # ---------------------------------------------------------------------------
-# 数据模型
+# Models
 # ---------------------------------------------------------------------------
 
 
@@ -96,7 +96,7 @@ class AircraftEvent(BaseModel):
 
 
 class CleanRecord(BaseModel):
-    """写入 Iceberg 的清洗后行。"""
+    """Cleaned row appended to the local Iceberg-style file."""
 
     event_id: str
     aircraft_id: str
@@ -110,19 +110,19 @@ class CleanRecord(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# 算子: Watermark / Dedup / Clean
+# Operators: watermark, dedup, clean
 # ---------------------------------------------------------------------------
 
 
 @dataclass
 class WatermarkAssigner:
     """
-    模拟 Flink BoundedOutOfOrdernessWatermarks。
+    Bounded out-of-orderness watermarks, matching the Flink SQL job.
 
     watermark = max_event_time_seen - max_out_of_orderness
-    - event_time < watermark                 → LATE
-    - LATE 且落后超过 allowed_lateness       → DROP
-    - 其余迟到数据仍允许进入窗口（纠正乱序）
+    - event_time < watermark                    → late
+    - late by more than allowed_lateness        → drop
+    - other late events are kept and marked late
     """
 
     max_out_of_orderness: timedelta
@@ -134,9 +134,9 @@ class WatermarkAssigner:
 
     def on_event(self, event_time: datetime) -> tuple[str, bool]:
         """
-        返回 (decision, is_late)
+        Return (decision, is_late).
 
-        decision: ACCEPT | DROP
+        decision is ACCEPT or DROP.
         """
         if self.max_event_time is None or event_time > self.max_event_time:
             self.max_event_time = event_time
@@ -157,7 +157,7 @@ class WatermarkAssigner:
 
 @dataclass
 class Deduplicator:
-    """按 event_id 去重，使用有界 LRU，避免 Demo 长时间运行撑爆内存。"""
+    """Dedup by event_id with a bounded LRU so a long demo does not grow without limit."""
 
     max_size: int = DEDUP_CACHE_SIZE
     seen: OrderedDict[str, None] = field(default_factory=OrderedDict)
@@ -191,7 +191,7 @@ class JobStats:
 
 
 def tail_jsonl(path: Path) -> Iterator[str]:
-    """从文件当前位置跟随写入，模拟 Kafka 消费。文件不存在则等待创建。"""
+    """Follow new lines from the current end of the file. Wait if it does not exist yet."""
     console.print(f"[src][FLINK-SOURCE] Waiting for JSONL: {path}[/]")
     while not path.exists():
         time.sleep(0.4)
@@ -224,7 +224,7 @@ def kafka_lines(bootstrap: str, topic: str, group_id: str) -> Optional[Iterator[
             request_timeout_ms=2_000,
             api_version=(2, 8, 0),
         )
-        # 触发一次集群探测
+        # One metadata lookup so a refused connection fails here.
         consumer.topics()
     except Exception as exc:  # noqa: BLE001
         console.print(f"[dim][FLINK-SOURCE] Kafka unavailable ({bootstrap}): {exc}[/]")
@@ -253,7 +253,7 @@ def open_source(args: argparse.Namespace) -> Iterator[str]:
         if stream is not None:
             return stream
         if args.source == "kafka":
-            console.print("[clean][FLINK-SOURCE] --source kafka 但无法连接，退出[/]")
+            console.print("[clean][FLINK-SOURCE] --source kafka was set, but Kafka is unreachable. Exiting.[/]")
             raise SystemExit(2)
     return tail_jsonl(args.jsonl)
 
@@ -264,7 +264,7 @@ def open_source(args: argparse.Namespace) -> Iterator[str]:
 
 
 class IcebergSink:
-    """把清洗后的行追加到本地目录，路径刻意做成 Iceberg table layout。"""
+    """Append cleaned rows under a path that mirrors an Iceberg table layout."""
 
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -282,13 +282,13 @@ class IcebergSink:
 
 
 # ---------------------------------------------------------------------------
-# 控制台
+# Console
 # ---------------------------------------------------------------------------
 
 
 def print_banner(args: argparse.Namespace, source_name: str) -> None:
     body = (
-        "[bold white]飞机传感器实时数据 Lakehouse  ·  Flink Job (simulated)[/]\n"
+        "[bold white]Aircraft telemetry lakehouse  ·  Flink job (simulated)[/]\n"
         f"[dim]source[/]     {source_name}\n"
         f"[dim]watermark[/]  max-out-of-orderness = {args.ooo}s    "
         f"allowed-lateness = {args.lateness}s\n"
@@ -300,7 +300,7 @@ def print_banner(args: argparse.Namespace, source_name: str) -> None:
         Panel(
             body,
             title="[ok]>> FLINK TELEMETRY PIPELINE[/]",
-            subtitle="[dim]Ctrl+C 停止[/]",
+            subtitle="[dim]Ctrl+C to stop[/]",
             border_style="bright_green",
             box=box.DOUBLE,
             padding=(1, 2),
@@ -337,7 +337,7 @@ def _fmt(dt: datetime) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 处理管线
+# Pipeline
 # ---------------------------------------------------------------------------
 
 
@@ -418,12 +418,12 @@ def process_line(
 
 
 # ---------------------------------------------------------------------------
-# 入口
+# Entry point
 # ---------------------------------------------------------------------------
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="模拟 Flink 实时处理作业")
+    parser = argparse.ArgumentParser(description="Simulated Flink job for aircraft telemetry")
     parser.add_argument("--source", choices=("auto", "kafka", "file"), default="auto")
     parser.add_argument(
         "--bootstrap",
@@ -432,7 +432,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--topic", default=KAFKA_TOPIC)
     parser.add_argument("--group", default="flink-telemetry-mvp")
     parser.add_argument("--jsonl", type=Path, default=DEFAULT_JSONL)
-    parser.add_argument("--ooo", type=float, default=DEFAULT_OOO_SECONDS, help="乱序容忍秒数")
+    parser.add_argument("--ooo", type=float, default=DEFAULT_OOO_SECONDS, help="Out-of-orderness bound in seconds")
     parser.add_argument("--lateness", type=float, default=ALLOWED_LATENESS_SECONDS)
     parser.add_argument("--temp-limit", type=float, default=ENGINE_TEMP_LIMIT)
     parser.add_argument("--no-kafka", action="store_true")
