@@ -214,16 +214,147 @@ The job uses:
 ```sql
 SET 'execution.checkpointing.interval' = '30s';
 SET 'execution.checkpointing.mode' = 'EXACTLY_ONCE';
+SET 'execution.checkpointing.externalized-checkpoint-retention' = 'RETAIN_ON_CANCELLATION';
+SET 'state.savepoints.dir' = 'file:///opt/flink/data/savepoints';
+SET 'restart-strategy.type' = 'fixed-delay';
+SET 'restart-strategy.fixed-delay.attempts' = '30';
+SET 'restart-strategy.fixed-delay.delay' = '15 s';
 ```
 
 Iceberg commits become visible after successful checkpoint-driven
 commits, so with this demo configuration a newly processed row is not
 necessarily visible to Spark immediately.
 
-> **Important:** checkpoint-based exactly-once processing and
-> business-level deduplication are not the same thing. Checkpoints
-> protect processing consistency during failure/recovery; `event_id`
-> state handles repeated business events.
+A checkpoint is an automatic recovery point. A savepoint is a planned
+stop. `scripts/submit_flink_job.ps1` does not restore either one. Resume from
+the last savepoint with `.\scripts\savepoint.ps1 stop` and `.\scripts\savepoint.ps1 resume`.
+
+> **Important:** checkpoint mode `EXACTLY_ONCE` configures the Kafka
+> source and the Iceberg commit to line up on a checkpoint. It is not,
+> by itself, a measured end-to-end guarantee. The TaskManager kill
+> below is one measured run. Checkpoint recovery and `event_id`
+> deduplication are also different mechanisms: a checkpoint restores
+> processing progress, and `event_id` state rejects a repeated business
+> event.
+
+### Savepoint recovery
+
+Measured on Flink 1.19.1, parallelism 1, 5 October 2026.
+
+1. Sent `SP-1b0520-A` and `SP-1b0520-B` for flight `AC-101-SP-1b0520`
+   into the open minute `2026-10-05 08:15:00`. Both were visible in
+   `aircraft_telemetry` before the stop.
+2. `flink stop` wrote
+   `file:///opt/flink/data/savepoints/savepoint-54cf36-fdbdf0b60bd6`
+   and stopped job `54cf36b02ac7f8f39396bab5a4f6e554`.
+3. The same SQL was submitted from that savepoint. The new job id is
+   `93e50f76223ffcb4f1750c2fcfada0c0`. The JobManager log says it
+   started from that savepoint and continued checkpoint ids at 13.
+4. Partition 0 `currentOffset` was 33468 before the stop. After restore
+   and two new records it was 33472, with `committedOffset` 33473.
+   The consumer group was still at the log end on all three partitions
+   (0: 33473, 1: 33332, 2: 33331), lag 0. Offsets were not rewound.
+5. Replaying `SP-1b0520-A` left one detail row and added one rejected
+   row with `reason = duplicate`. The closed minute kept
+   `event_count = 2` for A and B. Dedup state and window state survived
+   the savepoint.
+
+### TaskManager kill, 100,000 ids
+
+Same job, still parallelism 1. The producer wrote 100,000 unique ids
+for flight `REC-a1a588`. Flink was still near the start of that backlog
+when the TaskManager container was killed.
+
+| | |
+| --- | --- |
+| Job id | `93e50f76223ffcb4f1750c2fcfada0c0` (unchanged) |
+| Failure | 16:16:35, TaskManager no longer reachable, job `RESTARTING` |
+| Resume | 16:16:50, job `RUNNING` after the 15 second restart delay |
+| Restored checkpoint | `chk-20` under `file:/opt/flink/data/checkpoints/aircraft-telemetry/93e50f76223ffcb4f1750c2fcfada0c0/chk-20` |
+| Source counter at kill | 15,001 `numRecordsIn` on that attempt |
+| First Iceberg count after resume | 12,379, then still climbing |
+| Produced ids | 100,000 |
+| Iceberg rows after catch-up | 100,000 |
+| Distinct Iceberg ids | 100,000 |
+| Missing | 0 |
+| Unexpected | 0 |
+| Duplicate rows | 0 |
+| Rejected rows for this flight | 0 |
+
+On this run the id set in Iceberg matches the produced set with no
+duplicates. That is the result of one TaskManager kill while the
+JobManager and the checkpoint files stayed available. It does not
+measure JobManager loss, loss of the checkpoint directory, or a second
+failure during the catch-up.
+
+The source `numRecordsIn` counter reset when the TaskManager came back.
+It later stopped at 87,621. `12,379 + 87,621 = 100,000`, which matches
+the final table, but the durable evidence is the id comparison, not
+that counter.
+
+A comparison taken while the job was still draining (36,995 rows) showed
+63,005 missing ids. Those ids arrived on later checkpoints. Missing rows
+during the drain are checkpoint lag.
+
+### Kafka and Flink skew
+
+Measured after raising `aircraft-telemetry` to 12 partitions and
+resubmitting a fresh job at parallelism 3
+(`d52e60b8761d5178293fdcb4213d62ea`). No savepoint was restored into
+the new parallelism. No salting or other mitigation was added.
+
+Load: 60,000 events, 100 aircraft (`AC-S00`–`AC-S99`), `AC-S00` produced
+24,000 events (40%). The Kafka key is `aircraft_id`.
+
+Kafka accepted the batch in 25.2 seconds (2,385 records/s). The Flink
+source reached 60,000 records 181.6 seconds after the send started, about
+330 records/s average.
+
+New records by partition (offset delta, not the historical end offset):
+
+| Partition | Records | Share |
+| --- | ---: | ---: |
+| 0 | 2,546 | 4.2% |
+| 1 | 3,275 | 5.5% |
+| 2 | 1,815 | 3.0% |
+| 3 | 26,545 | 44.2% |
+| 4 | 1,816 | 3.0% |
+| 5 | 4,002 | 6.7% |
+| 6 | 2,182 | 3.6% |
+| 7 | 3,636 | 6.1% |
+| 8 | 4,725 | 7.9% |
+| 9 | 4,366 | 7.3% |
+| 10 | 2,546 | 4.2% |
+| 11 | 2,546 | 4.2% |
+
+Partition 3 is the hot key plus the other aircraft whose murmur2 hash
+lands there. Historical data is still only on partitions 0–2; those
+absolute offsets are not the skew.
+
+Flink assigns partitions round-robin, four per subtask. Source
+`numRecordsIn`:
+
+| Subtask | Partitions | Records | Share |
+| --- | --- | ---: | ---: |
+| 0 | 0, 3, 6, 9 | 35,639 | 59.4% |
+| 1 | 1, 4, 7, 10 | 11,273 | 18.8% |
+| 2 | 2, 5, 8, 11 | 13,088 | 21.8% |
+
+Subtasks 1 and 2 finished while subtask 0 was still reading the hot
+partition. The source imbalance is larger than the hottest partition
+because that partition shares a subtask with three others.
+
+`event_id` dedup and the local window aggregate were balanced
+(20,124 / 20,194 / 19,682, busiest 33.7%). They are chained on
+`event_id`, which is unique. `GlobalWindowAggregate` then received
+153 / 96 / 93 records (busiest 44.7%). That is the keyed shuffle after
+local aggregation, not the raw event stream. Its Iceberg writer was
+still at 0 because every event shared one open minute, so
+`aircraft_telemetry_1m` was not part of this measurement.
+
+Backpressure on the source and on the global window was `ok` for all
+13 samples taken during the 25 second produce. This run did not show
+backpressure. It did show a long single-subtask tail.
 
 ## Data model
 
@@ -251,7 +382,7 @@ Example telemetry event:
 
 `aircraft_id` and `flight_id` are the join keys for a later analytics project. This repository does not build flight, aircraft, airport, or weather tables.
 
-Changing units and column names does not fit in place on the old demo tables. `migrate_iceberg_v2.ps1` drops `aircraft_telemetry` and `aircraft_telemetry_rejected` on purpose. Normal `submit_flink_job.ps1` only creates missing tables. It does not drop them, and it refuses to start a second job of the same name.
+Changing units and column names does not fit in place on the old demo tables. `scripts/migrate_iceberg_v2.ps1` drops `aircraft_telemetry` and `aircraft_telemetry_rejected` on purpose. Normal `scripts/submit_flink_job.ps1` only creates missing tables. It does not drop them, and it refuses to start a second job of the same name.
 
 `event_time` comes from the JSON `timestamp` field.
 
@@ -350,18 +481,30 @@ operations such as data-file compaction and snapshot expiration.
 
 ```text
 .
-├── data_generator.py
-├── flink_job.py
-├── flink_job.sql
-├── send_test_event.py
-├── submit_flink_job.ps1
-├── requirements.txt
+├── src/
+│   ├── telemetry_event.py          shared V2 message and flight track
+│   ├── producers/
+│   │   ├── data_generator.py
+│   │   ├── send_test_event.py
+│   │   └── send_bulk_events.py
+│   └── simulator/
+│       └── flink_job.py            local stand-in, not the cluster job
+├── flink/
+│   └── flink_job.sql               cluster job
+├── scripts/
+│   ├── submit_flink_job.ps1
+│   ├── savepoint.ps1
+│   └── migrate_iceberg_v2.ps1      one-time table reset
+├── tests/
+│   ├── test_semantics.py
+│   ├── test_savepoint.py
+│   ├── test_recovery_100k.py
+│   └── test_skew.py
 ├── docs/
-│   └── images/
-│       ├── architecture.png
-│       ├── flink-processing-flow.png
-│       ├── watermark-late-events.png
-│       └── failure-recovery.png
+│   ├── images/
+│   └── sql/
+│       └── spark.sql
+├── requirements.txt
 └── README.md
 ```
 
@@ -371,15 +514,15 @@ No Kafka, Flink, or Spark is required for the lightweight simulation:
 
 ```powershell
 python -m pip install -r requirements.txt
-python data_generator.py --no-kafka
-python flink_job.py --source file
+python src/producers/data_generator.py --no-kafka
+python src/simulator/flink_job.py --source file
 ```
 
 Or:
 
 ```powershell
-python data_generator.py --interval 0.5 --anomaly-rate 0.05 --hot-rate 0.03
-python flink_job.py --ooo 5 --lateness 15 --temp-limit 1000
+python src/producers/data_generator.py --interval 0.5 --anomaly-rate 0.05 --hot-rate 0.03
+python src/simulator/flink_job.py --ooo 5 --lateness 15 --temp-limit 1000
 ```
 
 The local Python implementation is useful for demonstrating the
@@ -387,7 +530,7 @@ processing semantics without running the complete infrastructure.
 
 ## Run the real Flink SQL pipeline
 
-`flink_job.sql` expects the following services on the same Docker
+`flink/flink_job.sql` expects the following services on the same Docker
 network:
 
 ---
@@ -415,18 +558,39 @@ Spark SQL container `spark-iceberg`, catalog
 Submit the Flink SQL job:
 
 ```powershell
-.\submit_flink_job.ps1
+.\scripts\submit_flink_job.ps1
 ```
 
-The development submit script cancels the currently running job of the
-same name and submits a fresh one. It does not restore a savepoint, so
-state such as deduplication starts fresh.
+The submit script refuses to start a second
+`lakehouse-aircraft-telemetry` job. Cancel the running job explicitly
+before submitting again. Submit does not drop Iceberg tables and does
+not restore a savepoint, so a fresh submit starts deduplication state
+over.
+
+```powershell
+.\scripts\savepoint.ps1 stop
+.\scripts\savepoint.ps1 resume
+```
+
+`stop` takes a savepoint and writes the path to `savepoint-path.txt`.
+`resume` submits the current SQL from that path. Do not change
+parallelism between those two commands. The skew run below was a fresh
+submit at parallelism 3, not a restore of the parallelism-1 savepoint.
 
 ## Test scenarios
 
 ```powershell
 python tests/test_semantics.py
+python tests/test_savepoint.py
+python tests/test_recovery_100k.py
+python tests/test_skew.py
 ```
+
+`test_savepoint.py` stops the running job. `test_recovery_100k.py`
+kills `flink-taskmanager` and starts it again. `test_skew.py` expects
+12 topic partitions and Flink parallelism 3. The numbers from the
+5 October 2026 runs are in **Checkpoint and failure recovery** and
+**Kafka and Flink skew**.
 
 That check generates one correlated flight locally, then sends a scripted
 Kafka sequence and compares the detail table, the reject table, and
@@ -435,11 +599,11 @@ Kafka sequence and compares the detail table, the reject table, and
 Send controlled events one at a time:
 
 ```powershell
-python send_test_event.py normal
-python send_test_event.py duplicate
-python send_test_event.py overheat
-python send_test_event.py watermark
-python send_test_event.py too_late
+python src/producers/send_test_event.py normal
+python src/producers/send_test_event.py duplicate
+python src/producers/send_test_event.py overheat
+python src/producers/send_test_event.py watermark
+python src/producers/send_test_event.py too_late
 ```
 
 Recommended order for the controlled demo:

@@ -22,5 +22,8 @@ logs/
 
 # Local data
 data/
+
+savepoint-path.txt
+resume-from-savepoint.sql
 checkpoints/
 warehouse/

@@ -1,5 +1,5 @@
 """
-Local stand-in for the detail-table rules in flink_job.sql.
+Local stand-in for the detail-table rules in flink/flink_job.sql.
 
 Replays watermark classification and event_id dedup in pure Python.
 It does not run the 1-minute window. That aggregate exists only in Flink SQL.
@@ -8,7 +8,7 @@ It does not run the 1-minute window. That aggregate exists only in Flink SQL.
   2. Dedup         — keep the first copy of each event_id
   3. Overheat      — engine_temp_c > 1000 stays, flagged overheat
 
-Source order: Kafka, then the local JSONL file written by data_generator.py.
+Source order: Kafka, then the local JSONL file written by src/producers/data_generator.py.
 Sink: append-only file laid out like an Iceberg table,
 warehouse/iceberg/db/aircraft_telemetry/.
 """

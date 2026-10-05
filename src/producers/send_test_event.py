@@ -2,12 +2,12 @@
 
 Pick a scenario:
 
-    python send_test_event.py normal
-    python send_test_event.py duplicate
-    python send_test_event.py overheat
-    python send_test_event.py watermark
-    python send_test_event.py too_late
-    python send_test_event.py batch
+    python src/producers/send_test_event.py normal
+    python src/producers/send_test_event.py duplicate
+    python src/producers/send_test_event.py overheat
+    python src/producers/send_test_event.py watermark
+    python src/producers/send_test_event.py too_late
+    python src/producers/send_test_event.py batch
 
 Timestamps use millisecond precision and a Z suffix so Flink's ISO-8601
 parser accepts them. Send `normal` before `duplicate`. Send `watermark`
@@ -22,11 +22,17 @@ Deterministic watermark / late / window checks live in tests/test_semantics.py.
 
 import argparse
 import json
+import sys
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from kafka import KafkaProducer
+
+_SRC = Path(__file__).resolve().parents[1]
+if str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
 
 from telemetry_event import iso_z, message
 

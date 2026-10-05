@@ -31,6 +31,10 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.theme import Theme
 
+_SRC = Path(__file__).resolve().parents[1]
+if str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
+
 from telemetry_event import FlightTrack
 from rich.text import Text
 

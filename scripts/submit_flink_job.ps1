@@ -1,6 +1,7 @@
 ﻿# Flink container and SQL file
 $JobManager = "flink-jobmanager"
-$SqlFile = Join-Path $PSScriptRoot "flink_job.sql"
+$RepoRoot = Split-Path -Parent $PSScriptRoot
+$SqlFile = Join-Path $RepoRoot "flink\flink_job.sql"
 
 Write-Host "Submitting Flink SQL job..."
 

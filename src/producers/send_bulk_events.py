@@ -1,14 +1,14 @@
 """Send 100,000 aircraft-telemetry messages to Kafka.
 
-    python send_bulk_events.py
-    python send_bulk_events.py --count 100000 --bootstrap localhost:9092
+    python src/producers/send_bulk_events.py
+    python src/producers/send_bulk_events.py --count 100000 --bootstrap localhost:9092
 
 The Flink job must already be running. Rows show up in Iceberg after Flink
 has consumed them and completed a checkpoint. Parallelism is 1, so consuming
 100,000 records takes longer than sending them.
 
 Late and too_late are not in this mix. Those flags depend on the watermark
-moving between records; use `send_test_event.py batch` for that check.
+moving between records; use `src/producers/send_test_event.py batch` for that check.
 
 Every record is stamped two minutes ahead of now, so a watermark left by the
 small batch (anchor = now + 30s) does not mark this run too_late.
@@ -16,12 +16,18 @@ small batch (anchor = now + 30s) does not mark this run too_late.
 
 import argparse
 import json
+import sys
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from kafka import KafkaProducer
 from kafka.partitioner.default import DefaultPartitioner
+
+_SRC = Path(__file__).resolve().parents[1]
+if str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
 
 from telemetry_event import iso_z, message
 

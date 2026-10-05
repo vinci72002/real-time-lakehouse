@@ -2,7 +2,7 @@
 -- Aircraft telemetry lakehouse (Flink SQL)
 --
 -- Kafka topic: aircraft-telemetry
--- Message schema: flat V2 telemetry (see telemetry_event.py)
+-- Message schema: flat V2 telemetry (see src/telemetry_event.py)
 --
 -- Flow:
 --   Kafka
@@ -53,7 +53,7 @@
 --
 -- Schema changes are not applied by this script. CREATE TABLE IF NOT
 -- EXISTS leaves an existing table alone. To discard the pre-V2 demo
--- tables, run migrate_iceberg_v2.ps1 once, then submit this file.
+-- tables, run scripts/migrate_iceberg_v2.ps1 once, then submit this file.
 --
 -- Spark reads:
 --   demo.aviation.aircraft_telemetry
@@ -66,13 +66,13 @@
 -- Submit
 -- =============================================================
 
--- docker cp flink_job.sql flink-jobmanager:/tmp/flink_job.sql
+-- docker cp flink/flink_job.sql flink-jobmanager:/tmp/flink_job.sql
 --
 -- docker exec flink-jobmanager \
 --   ./bin/sql-client.sh -f /tmp/flink_job.sql
 --
 -- or:
--- .\submit_flink_job.ps1
+-- .\scripts\submit_flink_job.ps1
 --
 -- Flink UI:
 -- http://localhost:8081
@@ -98,13 +98,30 @@ SET 'pipeline.name' = 'lakehouse-aircraft-telemetry';
 
 SET 'execution.runtime-mode' = 'streaming';
 
-SET 'parallelism.default' = '1';
+-- 3 matches the TaskManager slot count. The skew measurement used this
+-- with 12 Kafka partitions. A savepoint taken at another parallelism
+-- cannot be restored onto this setting.
+SET 'parallelism.default' = '3';
 
 
 -- Iceberg commits a snapshot on a successful checkpoint.
 SET 'execution.checkpointing.interval' = '30s';
 
 SET 'execution.checkpointing.mode' = 'EXACTLY_ONCE';
+
+-- Keep the last checkpoint on disk so a cancelled job can still be resumed.
+-- Normal submit does not restore one. Resume only when a savepoint path is set.
+SET 'execution.checkpointing.externalized-checkpoint-retention' = 'RETAIN_ON_CANCELLATION';
+
+SET 'state.savepoints.dir' = 'file:///opt/flink/data/savepoints';
+
+-- TaskManager loss should come back while the JobManager stays up.
+-- 15 seconds gives the TaskManager container time to start again.
+SET 'restart-strategy.type' = 'fixed-delay';
+
+SET 'restart-strategy.fixed-delay.attempts' = '30';
+
+SET 'restart-strategy.fixed-delay.delay' = '15 s';
 
 
 -- State backend
