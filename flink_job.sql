@@ -2,28 +2,63 @@
 -- Aircraft telemetry lakehouse (Flink SQL)
 --
 -- Kafka topic: aircraft-telemetry
+-- Message schema: flat V2 telemetry (see telemetry_event.py)
 --
 -- Flow:
 --   Kafka
 --     → validate / tag data-quality issues
 --     → first valid copy of each event_id
 --         → aircraft_telemetry
+--         → aircraft_telemetry_1m   (event-time 1-minute tumble)
 --
 -- Business anomaly:
---   engine_temp > 1000
---     → keep in main table
+--   engine_temp_c > 1000
+--     → keep in the detail table
 --     → overheat = TRUE
 --
 -- Data-quality / processing issues:
 --   too_late / invalid / duplicate
 --     → aircraft_telemetry_rejected
 --
+-- Timing, as implemented:
+--
+--   watermark = max event_time seen - 5 seconds
+--
+--   out-of-order
+--     event_time is earlier than some event already seen,
+--     and event_time >= watermark.
+--     late = FALSE. The row is inside the 5-second out-of-orderness
+--     bound, so the 1-minute window keeps it while that minute is open.
+--
+--   late
+--     watermark - 15s <= event_time < watermark.
+--     The detail table stores the row with late = TRUE.
+--     Measured on Flink 1.19: the tumble still counts that row when
+--     the window has not fired (watermark < window_end). late_count
+--     is that subset. Being behind the watermark does not, by itself,
+--     keep the row out of an open minute.
+--
+--   too_late
+--     event_time < watermark - 15s.
+--     Rejected. Absent from the detail table and from the tumble.
+--
+--   window closed
+--     watermark >= window_end. The minute has been emitted.
+--     A later event for that minute does not change the aggregate row,
+--     even when the event is within 15 seconds and is stored on the
+--     detail table with late = TRUE.
+--
 -- Storage:
 --   Iceberg REST catalog + MinIO
+--
+-- Schema changes are not applied by this script. CREATE TABLE IF NOT
+-- EXISTS leaves an existing table alone. To discard the pre-V2 demo
+-- tables, run migrate_iceberg_v2.ps1 once, then submit this file.
 --
 -- Spark reads:
 --   demo.aviation.aircraft_telemetry
 --   demo.aviation.aircraft_telemetry_rejected
+--   demo.aviation.aircraft_telemetry_1m
 -- =============================================================
 
 
@@ -42,13 +77,17 @@
 -- Flink UI:
 -- http://localhost:8081
 --
--- Query main table:
+-- Query detail:
 -- docker exec spark-iceberg spark-sql -e \
 -- "SELECT * FROM demo.aviation.aircraft_telemetry LIMIT 20"
 --
--- Query rejected table:
+-- Query rejected:
 -- docker exec spark-iceberg spark-sql -e \
 -- "SELECT * FROM demo.aviation.aircraft_telemetry_rejected LIMIT 20"
+--
+-- Query 1-minute windows:
+-- docker exec spark-iceberg spark-sql -e \
+-- "SELECT * FROM demo.aviation.aircraft_telemetry_1m LIMIT 20"
 
 
 -- =============================================================
@@ -94,17 +133,23 @@ SET 'table.exec.state.ttl' = '1 h';
 
 CREATE TEMPORARY TABLE kafka_telemetry (
 
-    event_id       STRING,
-    aircraft_id    STRING,
-    `timestamp`    TIMESTAMP_LTZ(3),
+    event_id            STRING,
+    aircraft_id         STRING,
+    flight_id           STRING,
+    event_time          TIMESTAMP_LTZ(3),
 
-    telemetry      ROW<
-        altitude DOUBLE,
-        speed DOUBLE,
-        engine_temp DOUBLE
-    >,
+    latitude            DOUBLE,
+    longitude           DOUBLE,
+    altitude_ft         DOUBLE,
+    ground_speed_kts    DOUBLE,
+    vertical_speed_fpm  DOUBLE,
+    heading_deg         DOUBLE,
+    engine_temp_c       DOUBLE,
+    oil_pressure_psi    DOUBLE,
+    fuel_flow_kg_h      DOUBLE,
+    fuel_remaining_kg   DOUBLE,
+    outside_air_temp_c  DOUBLE,
 
-    -- Kafka metadata for traceability
     kafka_partition INT
         METADATA FROM 'partition' VIRTUAL,
     kafka_offset BIGINT
@@ -112,13 +157,9 @@ CREATE TEMPORARY TABLE kafka_telemetry (
     kafka_timestamp TIMESTAMP_LTZ(3)
         METADATA FROM 'timestamp' VIRTUAL,
 
-
-    -- Event-time field
-    event_time AS `timestamp`,
-    -- Processing time used by deduplication
     proc_time AS PROCTIME(),
 
-    -- Allow five seconds of out-of-order data
+    -- Five seconds of out-of-order data stay on time.
     WATERMARK FOR event_time
         AS event_time - INTERVAL '5' SECOND
 
@@ -133,14 +174,9 @@ WITH (
 
     'properties.group.id' = 'lakehouse-flink-telemetry',
 
-
-    -- Resume from committed offsets.
-    -- On the first run, start from latest.
-
     'scan.startup.mode' = 'group-offsets',
 
     'properties.auto.offset.reset' = 'latest',
-
 
     'format' = 'json',
 
@@ -188,27 +224,37 @@ CREATE DATABASE IF NOT EXISTS lakehouse.aviation;
 
 
 -- =============================================================
--- 2.1 Main Iceberg table
+-- 2.1 Detail table
 -- =============================================================
 
 CREATE TABLE IF NOT EXISTS
 lakehouse.aviation.aircraft_telemetry (
 
-    event_id       STRING,
-    aircraft_id    STRING,
-    event_time     TIMESTAMP_LTZ(6),
-    ingest_time    TIMESTAMP_LTZ(6),
-    altitude       DOUBLE,
-    speed          DOUBLE,
-    engine_temp    DOUBLE,
+    event_id            STRING,
+    aircraft_id         STRING,
+    flight_id           STRING,
+    event_time          TIMESTAMP_LTZ(6),
+    ingest_time         TIMESTAMP_LTZ(6),
 
-    -- Business anomaly flag.
-    -- High temperature is still valid telemetry.
-    overheat       BOOLEAN,
+    latitude            DOUBLE,
+    longitude           DOUBLE,
+    altitude_ft         DOUBLE,
+    ground_speed_kts    DOUBLE,
+    vertical_speed_fpm  DOUBLE,
+    heading_deg         DOUBLE,
+    engine_temp_c       DOUBLE,
+    oil_pressure_psi    DOUBLE,
+    fuel_flow_kg_h      DOUBLE,
+    fuel_remaining_kg   DOUBLE,
+    outside_air_temp_c  DOUBLE,
 
-    -- Event arrived behind the current watermark
-    -- but was still within the accepted late window.
-    late           BOOLEAN
+    -- engine_temp_c > 1000. The row is still valid telemetry.
+    overheat            BOOLEAN,
+
+    -- Behind the watermark, but not more than 15 seconds behind.
+    -- An open 1-minute window still counts these rows. A closed
+    -- window does not.
+    late                BOOLEAN
 
 )
 PARTITIONED BY (aircraft_id)
@@ -226,28 +272,35 @@ WITH (
 
 
 -- =============================================================
--- 2.2 Rejected Iceberg table
+-- 2.2 Rejected table
 -- =============================================================
 
 CREATE TABLE IF NOT EXISTS
 lakehouse.aviation.aircraft_telemetry_rejected (
 
-    event_id          STRING,
-    aircraft_id       STRING,
-    event_time        TIMESTAMP_LTZ(6),
-    ingest_time       TIMESTAMP_LTZ(6),
-    altitude          DOUBLE,
-    speed             DOUBLE,
-    engine_temp       DOUBLE,
-    reason            STRING,
+    event_id            STRING,
+    aircraft_id         STRING,
+    flight_id           STRING,
+    event_time          TIMESTAMP_LTZ(6),
+    ingest_time         TIMESTAMP_LTZ(6),
 
+    latitude            DOUBLE,
+    longitude           DOUBLE,
+    altitude_ft         DOUBLE,
+    ground_speed_kts    DOUBLE,
+    vertical_speed_fpm  DOUBLE,
+    heading_deg         DOUBLE,
+    engine_temp_c       DOUBLE,
+    oil_pressure_psi    DOUBLE,
+    fuel_flow_kg_h      DOUBLE,
+    fuel_remaining_kg   DOUBLE,
+    outside_air_temp_c  DOUBLE,
 
-    -- Kafka metadata allows us to trace
-    -- the rejected event back to the source.
+    reason              STRING,
 
-    kafka_partition   INT,
-    kafka_offset      BIGINT,
-    kafka_timestamp   TIMESTAMP_LTZ(3)
+    kafka_partition     INT,
+    kafka_offset        BIGINT,
+    kafka_timestamp     TIMESTAMP_LTZ(3)
 
 )
 PARTITIONED BY (aircraft_id)
@@ -259,6 +312,49 @@ WITH (
     'write.parquet.compression-codec' = 'zstd',
     'write.metadata.delete-after-commit.enabled' = 'true',
     'write.metadata.previous-versions-max' = '20'
+);
+
+
+
+-- =============================================================
+-- 2.3 One-minute event-time aggregate
+-- =============================================================
+--
+-- One row per aircraft_id, flight_id, and closed minute.
+-- Emitted once, when the watermark reaches window_end.
+-- Append-only: a closed minute is not updated.
+
+CREATE TABLE IF NOT EXISTS
+lakehouse.aviation.aircraft_telemetry_1m (
+
+    aircraft_id              STRING,
+    flight_id                STRING,
+    window_start             TIMESTAMP_LTZ(3),
+    window_end               TIMESTAMP_LTZ(3),
+
+    event_count              BIGINT,
+    avg_ground_speed_kts     DOUBLE,
+    max_ground_speed_kts     DOUBLE,
+    avg_altitude_ft          DOUBLE,
+    max_altitude_ft          DOUBLE,
+    avg_engine_temp_c        DOUBLE,
+    max_engine_temp_c        DOUBLE,
+    avg_fuel_flow_kg_h       DOUBLE,
+    min_fuel_remaining_kg    DOUBLE,
+    max_fuel_remaining_kg    DOUBLE,
+    late_count               BIGINT
+
+)
+PARTITIONED BY (aircraft_id)
+
+WITH (
+
+    'format-version' = '2',
+    'write.format.default' = 'parquet',
+    'write.parquet.compression-codec' = 'zstd',
+    'write.metadata.delete-after-commit.enabled' = 'true',
+    'write.metadata.previous-versions-max' = '20'
+
 );
 
 
@@ -267,54 +363,32 @@ WITH (
 -- 3. Tag every incoming event
 -- =============================================================
 
--- Lateness policy:
---
--- event_time >= watermark
---     → on time
---
--- watermark - 15s <= event_time < watermark
---     → late but accepted
---     → late = TRUE
---
--- event_time < watermark - 15s
---     → too late
---     → rejected
---
--- IMPORTANT:
---
--- engine_temp > 1000 is NOT a data-quality error.
--- It represents a business anomaly.
--- The event remains in the main table with:
---
---     overheat = TRUE
-
-
 CREATE TEMPORARY VIEW telemetry_tagged AS
 
 SELECT
 
     event_id,
     aircraft_id,
+    flight_id,
     event_time,
     proc_time,
 
-    telemetry.altitude
-        AS altitude,
-
-    telemetry.speed
-        AS speed,
-
-    telemetry.engine_temp
-        AS engine_temp,
-
-    -- ---------------------------------------------------------
-    -- Business anomaly
-    -- ---------------------------------------------------------
+    latitude,
+    longitude,
+    altitude_ft,
+    ground_speed_kts,
+    vertical_speed_fpm,
+    heading_deg,
+    engine_temp_c,
+    oil_pressure_psi,
+    fuel_flow_kg_h,
+    fuel_remaining_kg,
+    outside_air_temp_c,
 
     CASE
 
-        WHEN telemetry.engine_temp IS NOT NULL
-         AND telemetry.engine_temp > 1000
+        WHEN engine_temp_c IS NOT NULL
+         AND engine_temp_c > 1000
 
         THEN TRUE
 
@@ -322,19 +396,9 @@ SELECT
 
     END AS overheat,
 
-
-    -- ---------------------------------------------------------
-    -- Kafka traceability
-    -- ---------------------------------------------------------
-
     kafka_partition,
     kafka_offset,
     kafka_timestamp,
-
-
-    -- ---------------------------------------------------------
-    -- Late flag
-    -- ---------------------------------------------------------
 
     COALESCE(
 
@@ -344,17 +408,9 @@ SELECT
 
     ) AS late,
 
-
-    -- ---------------------------------------------------------
-    -- Data-quality rejection reasons
-    -- ---------------------------------------------------------
-
     NULLIF(
 
         CONCAT_WS(',',
-
-
-            -- Missing / blank event ID
 
             CASE
                 WHEN event_id IS NULL
@@ -362,33 +418,27 @@ SELECT
                 THEN 'blank_event_id'
             END,
 
-            -- Missing aircraft ID
-
             CASE
                 WHEN aircraft_id IS NULL
                   OR TRIM(aircraft_id) = ''
                 THEN 'missing_aircraft_id'
             END,
 
-
-            -- Missing event time
+            CASE
+                WHEN flight_id IS NULL
+                  OR TRIM(flight_id) = ''
+                THEN 'missing_flight_id'
+            END,
 
             CASE
                 WHEN event_time IS NULL
                 THEN 'missing_event_time'
             END,
 
-
-            -- Missing engine temperature
-
             CASE
-                WHEN telemetry.engine_temp IS NULL
+                WHEN engine_temp_c IS NULL
                 THEN 'missing_engine_temp'
             END,
-
-
-            -- Event is more than 15 seconds
-            -- behind the current watermark.
 
             CASE
                 WHEN CURRENT_WATERMARK(event_time) IS NOT NULL
@@ -403,7 +453,6 @@ SELECT
         ''
     ) AS reject_reason
 
-
 FROM kafka_telemetry;
 
 
@@ -411,13 +460,8 @@ FROM kafka_telemetry;
 -- =============================================================
 -- 4. Clean events
 -- =============================================================
-
--- Only events without a data-quality rejection
--- continue into the clean stream.
 --
--- NOTE:
--- overheat events are still valid and therefore remain here.
-
+-- Overheat rows have no reject_reason, so they stay here.
 
 CREATE TEMPORARY VIEW telemetry_clean AS
 
@@ -425,18 +469,29 @@ SELECT
 
     event_id,
     aircraft_id,
+    flight_id,
     event_time,
     proc_time,
-    altitude,
-    speed,
-    engine_temp,
+
+    latitude,
+    longitude,
+    altitude_ft,
+    ground_speed_kts,
+    vertical_speed_fpm,
+    heading_deg,
+    engine_temp_c,
+    oil_pressure_psi,
+    fuel_flow_kg_h,
+    fuel_remaining_kg,
+    outside_air_temp_c,
+
     overheat,
+    late,
 
     kafka_partition,
     kafka_offset,
-    kafka_timestamp,
+    kafka_timestamp
 
-    late
 FROM telemetry_tagged
 
 WHERE reject_reason IS NULL;
@@ -444,16 +499,57 @@ WHERE reject_reason IS NULL;
 
 
 -- =============================================================
--- 5. Detect duplicate events
+-- 5. First copy of each event_id
 -- =============================================================
-
--- The first event is written to the main table.
 --
--- Second and later copies of the same event_id
--- are captured here and written to the rejected table.
---
--- State TTL = 1 hour.
+-- Processing-time order. State TTL = 1 hour.
+-- The duplicate view below emits the later copies.
 
+CREATE TEMPORARY VIEW telemetry_first AS
+
+SELECT
+
+    event_id,
+    aircraft_id,
+    flight_id,
+    event_time,
+    proc_time,
+
+    latitude,
+    longitude,
+    altitude_ft,
+    ground_speed_kts,
+    vertical_speed_fpm,
+    heading_deg,
+    engine_temp_c,
+    oil_pressure_psi,
+    fuel_flow_kg_h,
+    fuel_remaining_kg,
+    outside_air_temp_c,
+
+    overheat,
+    late
+
+FROM (
+
+    SELECT
+
+        *,
+        ROW_NUMBER() OVER (
+            PARTITION BY event_id
+            ORDER BY proc_time ASC
+        ) AS rn
+
+    FROM telemetry_clean
+)
+
+WHERE rn = 1;
+
+
+
+-- =============================================================
+-- 6. Duplicate copies
+-- =============================================================
 
 CREATE TEMPORARY VIEW telemetry_duplicate AS
 
@@ -461,11 +557,21 @@ SELECT
 
     event_id,
     aircraft_id,
+    flight_id,
     event_time,
     proc_time,
-    altitude,
-    speed,
-    engine_temp,
+
+    latitude,
+    longitude,
+    altitude_ft,
+    ground_speed_kts,
+    vertical_speed_fpm,
+    heading_deg,
+    engine_temp_c,
+    oil_pressure_psi,
+    fuel_flow_kg_h,
+    fuel_remaining_kg,
+    outside_air_temp_c,
 
     kafka_partition,
     kafka_offset,
@@ -479,39 +585,28 @@ MATCH_RECOGNIZE (
     ORDER BY proc_time
 
     MEASURES
-        S.aircraft_id
-            AS aircraft_id,
-
-        S.event_time
-            AS event_time,
-
-        S.proc_time
-            AS proc_time,
-
-        S.altitude
-            AS altitude,
-
-        S.speed
-            AS speed,
-
-        S.engine_temp
-            AS engine_temp,
-
-        S.kafka_partition
-            AS kafka_partition,
-
-        S.kafka_offset
-            AS kafka_offset,
-
-        S.kafka_timestamp
-            AS kafka_timestamp
-
+        S.aircraft_id AS aircraft_id,
+        S.flight_id AS flight_id,
+        S.event_time AS event_time,
+        S.proc_time AS proc_time,
+        S.latitude AS latitude,
+        S.longitude AS longitude,
+        S.altitude_ft AS altitude_ft,
+        S.ground_speed_kts AS ground_speed_kts,
+        S.vertical_speed_fpm AS vertical_speed_fpm,
+        S.heading_deg AS heading_deg,
+        S.engine_temp_c AS engine_temp_c,
+        S.oil_pressure_psi AS oil_pressure_psi,
+        S.fuel_flow_kg_h AS fuel_flow_kg_h,
+        S.fuel_remaining_kg AS fuel_remaining_kg,
+        S.outside_air_temp_c AS outside_air_temp_c,
+        S.kafka_partition AS kafka_partition,
+        S.kafka_offset AS kafka_offset,
+        S.kafka_timestamp AS kafka_timestamp
 
     ONE ROW PER MATCH
 
-
     AFTER MATCH SKIP TO LAST S
-
 
     PATTERN (A S)
 
@@ -526,31 +621,13 @@ MATCH_RECOGNIZE (
 
 
 -- =============================================================
--- 6. Write main + rejected outputs
+-- 7. Write detail, rejected, and 1-minute aggregate
 -- =============================================================
-
--- Both INSERT statements are executed as one Statement Set.
---
--- Main table:
---     valid events
---     first copy of event_id
---     overheat is retained as a business flag
---
--- Rejected table:
---     invalid
---     too late
---     duplicate
-
 
 EXECUTE STATEMENT SET
 
 BEGIN
 
-
-
--- =============================================================
--- 6.1 Main table
--- =============================================================
 
 INSERT INTO lakehouse.aviation.aircraft_telemetry
 
@@ -558,33 +635,28 @@ SELECT
 
     event_id,
     aircraft_id,
+    flight_id,
     event_time,
     proc_time AS ingest_time,
-    altitude,
-    speed,
-    engine_temp,
+
+    latitude,
+    longitude,
+    altitude_ft,
+    ground_speed_kts,
+    vertical_speed_fpm,
+    heading_deg,
+    engine_temp_c,
+    oil_pressure_psi,
+    fuel_flow_kg_h,
+    fuel_remaining_kg,
+    outside_air_temp_c,
+
     overheat,
     late
 
-FROM (
-
-    SELECT
-
-        *,
-        ROW_NUMBER() OVER (
-            PARTITION BY event_id
-            ORDER BY proc_time ASC
-        ) AS rn
-    FROM telemetry_clean
-)
-
-WHERE rn = 1;
+FROM telemetry_first;
 
 
-
--- =============================================================
--- 6.2 Rejected table
--- =============================================================
 
 INSERT INTO lakehouse.aviation.aircraft_telemetry_rejected
 
@@ -592,11 +664,22 @@ SELECT
 
     event_id,
     aircraft_id,
+    flight_id,
     event_time,
     proc_time AS ingest_time,
-    altitude,
-    speed,
-    engine_temp,
+
+    latitude,
+    longitude,
+    altitude_ft,
+    ground_speed_kts,
+    vertical_speed_fpm,
+    heading_deg,
+    engine_temp_c,
+    oil_pressure_psi,
+    fuel_flow_kg_h,
+    fuel_remaining_kg,
+    outside_air_temp_c,
+
     reason,
     kafka_partition,
     kafka_offset,
@@ -604,19 +687,26 @@ SELECT
 
 FROM (
 
-    -- ---------------------------------------------------------
-    -- Data-quality rejects
-    -- ---------------------------------------------------------
-
     SELECT
 
         event_id,
         aircraft_id,
+        flight_id,
         event_time,
         proc_time,
-        altitude,
-        speed,
-        engine_temp,
+
+        latitude,
+        longitude,
+        altitude_ft,
+        ground_speed_kts,
+        vertical_speed_fpm,
+        heading_deg,
+        engine_temp_c,
+        oil_pressure_psi,
+        fuel_flow_kg_h,
+        fuel_remaining_kg,
+        outside_air_temp_c,
+
         reject_reason AS reason,
 
         kafka_partition,
@@ -629,21 +719,26 @@ FROM (
 
     UNION ALL
 
-
-
-    -- ---------------------------------------------------------
-    -- Duplicate events
-    -- ---------------------------------------------------------
-
     SELECT
 
         event_id,
         aircraft_id,
+        flight_id,
         event_time,
         proc_time,
-        altitude,
-        speed,
-        engine_temp,
+
+        latitude,
+        longitude,
+        altitude_ft,
+        ground_speed_kts,
+        vertical_speed_fpm,
+        heading_deg,
+        engine_temp_c,
+        oil_pressure_psi,
+        fuel_flow_kg_h,
+        fuel_remaining_kg,
+        outside_air_temp_c,
+
         'duplicate' AS reason,
 
         kafka_partition,
@@ -653,6 +748,50 @@ FROM (
     FROM telemetry_duplicate
 
 );
+
+
+
+-- Only rows still inside an unfired minute are aggregated.
+-- late = TRUE rows are included while watermark < window_end.
+-- After the watermark passes window_end the row is final.
+
+INSERT INTO lakehouse.aviation.aircraft_telemetry_1m
+
+SELECT
+
+    aircraft_id,
+    flight_id,
+    window_start,
+    window_end,
+
+    COUNT(*) AS event_count,
+    AVG(ground_speed_kts) AS avg_ground_speed_kts,
+    MAX(ground_speed_kts) AS max_ground_speed_kts,
+    AVG(altitude_ft) AS avg_altitude_ft,
+    MAX(altitude_ft) AS max_altitude_ft,
+    AVG(engine_temp_c) AS avg_engine_temp_c,
+    MAX(engine_temp_c) AS max_engine_temp_c,
+    AVG(fuel_flow_kg_h) AS avg_fuel_flow_kg_h,
+    MIN(fuel_remaining_kg) AS min_fuel_remaining_kg,
+    MAX(fuel_remaining_kg) AS max_fuel_remaining_kg,
+    COUNT(CASE WHEN late THEN 1 END) AS late_count
+
+FROM TABLE(
+
+    TUMBLE(
+        TABLE telemetry_first,
+        DESCRIPTOR(event_time),
+        INTERVAL '1' MINUTE
+    )
+
+)
+
+GROUP BY
+
+    aircraft_id,
+    flight_id,
+    window_start,
+    window_end;
 
 
 END;

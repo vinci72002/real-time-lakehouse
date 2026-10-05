@@ -1,11 +1,12 @@
 """
 Aircraft telemetry producer.
 
-Simulates three aircraft and prints each sensor event as it is emitted.
+Simulates three aircraft on city-pair routes and prints each sensor event.
 
 - One event every 0.5 seconds (configurable)
-- About 5% of events are late (timestamp shifted back) or reuse an event_id
-- About 3% set engine_temp above 1000 so the downstream job can reject them
+- About 5% of events are late, out-of-order, too-late, or a reused event_id
+- About 3% set engine_temp_c above 1000 so the downstream job flags overheat
+- Position, altitude, speed, vertical speed, and fuel move together by flight phase
 - Writes a local JSONL file, and also publishes to Kafka when it is reachable
 """
 
@@ -24,12 +25,13 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
-from pydantic import BaseModel, Field
 from rich import box
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 from rich.theme import Theme
+
+from telemetry_event import FlightTrack
 from rich.text import Text
 
 
@@ -47,7 +49,11 @@ _configure_stdio()
 # Constants
 # ---------------------------------------------------------------------------
 
-AIRCRAFT_IDS = ("AC-101", "AC-102", "AC-103")
+ROUTES = {
+    "AC-101": ((31.144, 121.805), (40.080, 116.585)),  # Shanghai - Beijing
+    "AC-102": ((22.309, 113.922), (31.144, 121.805)),  # Hong Kong - Shanghai
+    "AC-103": ((30.578, 103.947), (23.392, 113.299)),  # Chengdu - Guangzhou
+}
 DEFAULT_INTERVAL = 0.5
 DEFAULT_ANOMALY_RATE = 0.05
 DEFAULT_HOT_RATE = 0.03
@@ -77,68 +83,26 @@ console = Console(theme=THEME, highlight=False, legacy_windows=False)
 
 
 # ---------------------------------------------------------------------------
-# Models
+# Fleet
 # ---------------------------------------------------------------------------
 
-
-class Telemetry(BaseModel):
-    """One sensor sample."""
-
-    altitude: float = Field(..., description="Altitude in meters")
-    speed: float = Field(..., description="True airspeed in km/h")
-    engine_temp: float = Field(..., description="Exhaust gas temperature in Celsius")
+AIRCRAFT_IDS = tuple(ROUTES)
 
 
-class AircraftEvent(BaseModel):
-    """Event envelope written to Kafka and the local JSONL file."""
-
-    event_id: str
-    aircraft_id: str
-    timestamp: str
-    telemetry: Telemetry
-    anomaly: Optional[str] = Field(
-        default=None,
-        description="Demo tag: late, duplicate, or overheat. Omit in production.",
-    )
-
-
-# ---------------------------------------------------------------------------
-# Flight state. A small random walk so the series looks like cruise.
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class AircraftState:
-    aircraft_id: str
-    altitude: float
-    speed: float
-    engine_temp: float
-    last_event_id: Optional[str] = None
-    emitted: int = 0
-
-    def tick(self) -> Telemetry:
-        """Nudge altitude, speed, and temperature, and keep them in range."""
-        self.altitude = _clamp(self.altitude + random.uniform(-80, 80), 8_800, 12_200)
-        self.speed = _clamp(self.speed + random.uniform(-12, 12), 720, 920)
-        self.engine_temp = _clamp(self.engine_temp + random.uniform(-8, 8), 520, 860)
-        self.emitted += 1
-        return Telemetry(
-            altitude=round(self.altitude, 1),
-            speed=round(self.speed, 1),
-            engine_temp=round(self.engine_temp, 1),
-        )
-
-
-def _clamp(value: float, low: float, high: float) -> float:
-    return max(low, min(high, value))
-
-
-def _fleet() -> list[AircraftState]:
-    """Three slightly different cruise profiles so the aircraft are easy to tell apart."""
+def _fleet() -> list[FlightTrack]:
+    now = datetime.now(timezone.utc)
     return [
-        AircraftState("AC-101", altitude=10_800, speed=860, engine_temp=690),
-        AircraftState("AC-102", altitude=10_200, speed=820, engine_temp=640),
-        AircraftState("AC-103", altitude=11_400, speed=880, engine_temp=710),
+        FlightTrack(
+            aircraft_id,
+            origin,
+            dest,
+            started=now - timedelta(seconds=offset),
+            elapsed_s=offset,
+        )
+        for offset, (aircraft_id, (origin, dest)) in zip(
+            (400, 1400, 2800),
+            ROUTES.items(),
+        )
     ]
 
 
@@ -185,14 +149,14 @@ class OptionalKafka:
             console.print(f"[dim]Kafka unavailable ({self.bootstrap}): {exc}[/]")
             console.print("[dim]Falling back to local JSONL. The simulated job tails that file.[/]")
 
-    def send(self, event: AircraftEvent) -> None:
+    def send(self, payload: dict) -> None:
         if not self.ok or self.producer is None:
             return
         try:
             self.producer.send(
                 self.topic,
-                key=event.aircraft_id,
-                value=event.model_dump_json(),
+                key=payload["aircraft_id"],
+                value=json.dumps(payload),
             )
             self.sent += 1
         except Exception:  # noqa: BLE001
@@ -224,54 +188,69 @@ class GeneratorStats:
 
 
 def build_event(
-    aircraft: AircraftState,
+    aircraft: FlightTrack,
     anomaly_rate: float,
     hot_rate: float,
     stats: GeneratorStats,
-) -> AircraftEvent:
+) -> tuple[dict, Optional[str]]:
+    """Advance one flight sample and occasionally inject an anomaly.
+
+    The anomaly tag is for the console only. It is not written to Kafka.
+    Timestamp shifts are classified by Flink, not by this tag:
+
+    - 2 to 4 seconds back: inside the 5-second watermark (out of order)
+    - 8 to 14 seconds back: late on the detail table, dropped by the window
+    - 60 seconds back: too late, rejected
     """
-    Build one event. With probability anomaly_rate, make it late or a duplicate.
-    Independently, with probability hot_rate, push engine temperature out of range.
-    """
-    now = datetime.now(timezone.utc)
-    telemetry = aircraft.tick()
-    event_id = str(uuid.uuid4())
+    previous = aircraft.last_message
+    payload = aircraft.advance(1.0)
     anomaly: Optional[str] = None
 
     roll = random.random()
-    if roll < anomaly_rate:
-        # Half late, half duplicate. A duplicate needs a previous event_id.
-        if aircraft.last_event_id and random.random() < 0.5:
-            event_id = aircraft.last_event_id
+    if roll < anomaly_rate and previous is not None:
+        kind = random.random()
+        if kind < 0.4:
+            payload = dict(previous)
+            aircraft.last_message = previous
             anomaly = "duplicate"
             stats.duplicate += 1
         else:
-            # Shift the timestamp back 8–25s, past the 5s watermark.
-            delay = random.uniform(8, 25)
-            now = now - timedelta(seconds=delay)
-            anomaly = "late"
-            stats.late += 1
+            raw = payload["event_time"].replace("Z", "+00:00")
+            event_time = datetime.fromisoformat(raw)
+            if kind < 0.6:
+                payload["event_time"] = (
+                    event_time - timedelta(seconds=random.uniform(2, 4))
+                ).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+                anomaly = "out_of_order"
+                stats.late += 1
+            elif kind < 0.9:
+                payload["event_time"] = (
+                    event_time - timedelta(seconds=random.uniform(8, 14))
+                ).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+                anomaly = "late"
+                stats.late += 1
+            else:
+                payload["event_time"] = (
+                    event_time - timedelta(seconds=60)
+                ).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+                anomaly = "too_late"
+                stats.late += 1
+            payload["event_id"] = str(uuid.uuid4())
     else:
         stats.normal += 1
 
-    if random.random() < hot_rate:
-        telemetry.engine_temp = round(random.uniform(1_050, 1_280), 1)
+    if anomaly != "duplicate" and random.random() < hot_rate:
+        payload["engine_temp_c"] = round(random.uniform(1050, 1200), 1)
+        payload["fuel_flow_kg_h"] = 3600.0
         anomaly = "overheat" if anomaly is None else f"{anomaly}+overheat"
         stats.overheat += 1
 
     if anomaly != "duplicate":
-        aircraft.last_event_id = event_id
+        aircraft.last_message = payload
 
     stats.total += 1
     stats.per_ac[aircraft.aircraft_id] += 1
-
-    return AircraftEvent(
-        event_id=event_id,
-        aircraft_id=aircraft.aircraft_id,
-        timestamp=now.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
-        telemetry=telemetry,
-        anomaly=anomaly,
-    )
+    return payload, anomaly
 
 
 # ---------------------------------------------------------------------------
@@ -285,7 +264,7 @@ def print_banner(interval: float, kafka: OptionalKafka) -> None:
         "[banner]Aircraft telemetry lakehouse  ·  Producer[/]\n"
         f"[dim]fleet[/]  AC-101   AC-102   AC-103\n"
         f"[dim]rate[/]   one event every [stat]{interval:.1f}s[/]   "
-        f"[dim]anomaly[/]  5% late/duplicate   [dim]dirty[/]  3% overheat\n"
+        f"[dim]anomaly[/]  5% duplicate/time-shift   [dim]dirty[/]  3% overheat\n"
         f"[dim]sink[/]   {sink}   [dim]topic[/]  {KAFKA_TOPIC}"
     )
     console.print(
@@ -306,6 +285,10 @@ def _badge(anomaly: Optional[str]) -> Text:
         return Text(" NORMAL ", style="black on bright_green")
     if "duplicate" in anomaly:
         return Text("  DUP   ", style="black on bright_magenta")
+    if anomaly == "too_late" or anomaly.startswith("too_late"):
+        return Text("  LATE+ ", style="black on yellow")
+    if "out_of_order" in anomaly:
+        return Text("  OOO   ", style="black on yellow")
     if "late" in anomaly:
         return Text("  LATE  ", style="black on yellow")
     if "overheat" in anomaly:
@@ -313,32 +296,32 @@ def _badge(anomaly: Optional[str]) -> Text:
     return Text(f" {anomaly.upper()} ", style="white on red")
 
 
-def print_event(event: AircraftEvent) -> None:
-    t = event.telemetry
-    ac_style = AIRCRAFT_STYLE.get(event.aircraft_id, "white")
+def print_event(payload: dict, anomaly: Optional[str]) -> None:
+    ac_style = AIRCRAFT_STYLE.get(payload["aircraft_id"], "white")
     wall = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-    event_ts = event.timestamp[11:23] if len(event.timestamp) >= 23 else event.timestamp
+    event_ts = payload["event_time"][11:23]
 
     line = Text()
     line.append(f" {wall} ", style="dim")
-    line.append(f" {event.aircraft_id} ", style=f"black on {ac_style.split()[-1]}")
+    line.append(f" {payload['aircraft_id']} ", style=f"black on {ac_style.split()[-1]}")
     line.append("  ")
-    line.append_text(_badge(event.anomaly))
+    line.append_text(_badge(anomaly))
     line.append("  ")
-    line.append(f"alt={t.altitude:>8,.1f} m", style="bright_white")
+    line.append(f"alt={payload['altitude_ft']:>8,.0f} ft", style="bright_white")
     line.append("   ")
-    line.append(f"spd={t.speed:>6.1f} km/h", style="bright_white")
+    line.append(f"gs={payload['ground_speed_kts']:>6.0f} kt", style="bright_white")
     line.append("   ")
-    temp_style = "hot" if t.engine_temp > 1000 else "bright_white"
-    line.append(f"temp={t.engine_temp:>7.1f} °C", style=temp_style)
+    line.append(f"vs={payload['vertical_speed_fpm']:>7.0f}", style="bright_white")
+    temp = payload["engine_temp_c"]
+    temp_style = "hot" if temp > 1000 else "bright_white"
+    line.append(f"  egt={temp:>6.0f} C", style=temp_style)
     line.append("   ")
-    line.append(f"id={event.event_id[:8]}", style="dim")
-    if event.anomaly == "late":
+    line.append(f"fuel={payload['fuel_remaining_kg']:>8,.0f} kg", style="bright_white")
+    line.append("   ")
+    line.append(f"id={payload['event_id'][:8]}", style="dim")
+    if anomaly in ("late", "out_of_order", "too_late"):
         line.append(f"   event_time={event_ts}", style="late")
     console.print(line)
-
-    # Compact JSON so the full payload fits on one line.
-    payload = event.model_dump(exclude_none=True)
     console.print(f"   [dim]{json.dumps(payload, ensure_ascii=False)}[/]")
 
 
@@ -410,12 +393,14 @@ def main() -> int:
         with args.jsonl.open("a", encoding="utf-8") as sink:
             while running:
                 aircraft = random.choice(fleet)
-                event = build_event(aircraft, args.anomaly_rate, args.hot_rate, stats)
-                line = event.model_dump_json()
+                payload, anomaly = build_event(
+                    aircraft, args.anomaly_rate, args.hot_rate, stats
+                )
+                line = json.dumps(payload)
                 sink.write(line + "\n")
                 sink.flush()
-                kafka.send(event)
-                print_event(event)
+                kafka.send(payload)
+                print_event(payload, anomaly)
 
                 if stats.total % 20 == 0:
                     print_stats(stats, kafka)

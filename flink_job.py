@@ -1,11 +1,12 @@
 """
-Local stand-in for the Flink SQL job.
+Local stand-in for the detail-table rules in flink_job.sql.
 
-Replays the three operators in pure Python, with no Flink cluster:
+Replays watermark classification and event_id dedup in pure Python.
+It does not run the 1-minute window. That aggregate exists only in Flink SQL.
 
   1. Watermark     — flag event time that falls behind the watermark
   2. Dedup         — keep the first copy of each event_id
-  3. Clean         — drop engine_temp above 1000
+  3. Overheat      — engine_temp_c > 1000 stays, flagged overheat
 
 Source order: Kafka, then the local JSONL file written by data_generator.py.
 Sink: append-only file laid out like an Iceberg table,
@@ -26,7 +27,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterator, Optional
 
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, ValidationError
 from rich import box
 from rich.console import Console
 from rich.panel import Panel
@@ -77,21 +78,25 @@ console = Console(theme=THEME, highlight=False, legacy_windows=False)
 # ---------------------------------------------------------------------------
 
 
-class Telemetry(BaseModel):
-    altitude: float
-    speed: float
-    engine_temp: float
-
-
 class AircraftEvent(BaseModel):
     event_id: str
     aircraft_id: str
-    timestamp: str
-    telemetry: Telemetry
-    anomaly: Optional[str] = None
+    flight_id: str
+    event_time: str
+    latitude: float
+    longitude: float
+    altitude_ft: float
+    ground_speed_kts: float
+    vertical_speed_fpm: float
+    heading_deg: float
+    engine_temp_c: float
+    oil_pressure_psi: float
+    fuel_flow_kg_h: float
+    fuel_remaining_kg: float
+    outside_air_temp_c: float
 
-    def event_time(self) -> datetime:
-        raw = self.timestamp.replace("Z", "+00:00")
+    def event_timestamp(self) -> datetime:
+        raw = self.event_time.replace("Z", "+00:00")
         return datetime.fromisoformat(raw)
 
 
@@ -100,11 +105,14 @@ class CleanRecord(BaseModel):
 
     event_id: str
     aircraft_id: str
+    flight_id: str
     event_time: str
     ingest_time: str
-    altitude: float
-    speed: float
-    engine_temp: float
+    altitude_ft: float
+    ground_speed_kts: float
+    engine_temp_c: float
+    fuel_remaining_kg: float
+    overheat: bool
     watermark: str
     late: bool = False
 
@@ -293,7 +301,7 @@ def print_banner(args: argparse.Namespace, source_name: str) -> None:
         f"[dim]watermark[/]  max-out-of-orderness = {args.ooo}s    "
         f"allowed-lateness = {args.lateness}s\n"
         f"[dim]dedup[/]      key = event_id     cache = {DEDUP_CACHE_SIZE}\n"
-        f"[dim]clean[/]      drop engine_temp > {args.temp_limit:g}\n"
+        f"[dim]clean[/]      keep engine_temp_c > {args.temp_limit:g} as overheat\n"
         f"[dim]sink[/]       iceberg://local/{ICEBERG_SINK.as_posix()}"
     )
     console.print(
@@ -324,7 +332,7 @@ def print_stats(stats: JobStats, wm: WatermarkAssigner) -> None:
     table.add_row("watermark", "late accepted", str(wm.late_accepted))
     table.add_row("watermark", "late dropped", str(wm.late_dropped))
     table.add_row("dedup", "dropped", str(stats.dedup_drop))
-    table.add_row("clean", "overheat dropped", str(stats.clean_drop))
+    table.add_row("clean", "overheat kept", str(stats.clean_drop))
     table.add_row("iceberg", "written", str(stats.sunk))
     if wm.watermark is not None:
         table.add_row("watermark", "current", _fmt(wm.watermark))
@@ -357,7 +365,7 @@ def process_line(
         console.print(f"[clean][FLINK-CLEAN] Dropped invalid payload: {exc}[/]")
         return
 
-    event_time = event.event_time()
+    event_time = event.event_timestamp()
     decision, is_late = wm.on_event(event_time)
     wm_text = _fmt(wm.watermark) if wm.watermark else "-"
 
@@ -384,36 +392,39 @@ def process_line(
         )
         return
 
-    if event.telemetry.engine_temp > temp_limit:
+    overheat = event.engine_temp_c > temp_limit
+    if overheat:
         stats.clean_drop += 1
         console.print(
-            f"[clean][FLINK-CLEAN] Dropped dirty record "
+            f"[clean][FLINK-CLEAN] Overheat kept "
             f"event_id={event.event_id[:8]}  aircraft={event.aircraft_id}  "
-            f"engine_temp={event.telemetry.engine_temp:.1f} > {temp_limit:g}[/]"
+            f"engine_temp_c={event.engine_temp_c:.1f} > {temp_limit:g}[/]"
         )
-        return
 
     row = CleanRecord(
         event_id=event.event_id,
         aircraft_id=event.aircraft_id,
-        event_time=event.timestamp,
+        flight_id=event.flight_id,
+        event_time=event.event_time,
         ingest_time=datetime.now(timezone.utc)
         .isoformat(timespec="milliseconds")
         .replace("+00:00", "Z"),
-        altitude=event.telemetry.altitude,
-        speed=event.telemetry.speed,
-        engine_temp=event.telemetry.engine_temp,
+        altitude_ft=event.altitude_ft,
+        ground_speed_kts=event.ground_speed_kts,
+        engine_temp_c=event.engine_temp_c,
+        fuel_remaining_kg=event.fuel_remaining_kg,
+        overheat=overheat,
         watermark=wm_text,
         late=is_late,
     )
     sink.write(row)
     stats.sunk += 1
     console.print(
-        f"[sink][FLINK-SINK] Written to Iceberg: "
-        f"db.aircraft_telemetry  aircraft={event.aircraft_id}  "
+        f"[sink][FLINK-SINK] Written to local file: "
+        f"aircraft={event.aircraft_id}  flight={event.flight_id}  "
         f"event_id={event.event_id}  "
-        f"alt={event.telemetry.altitude:.1f}  "
-        f"temp={event.telemetry.engine_temp:.1f}[/]"
+        f"alt={event.altitude_ft:.0f}ft  "
+        f"temp={event.engine_temp_c:.1f}[/]"
     )
 
 

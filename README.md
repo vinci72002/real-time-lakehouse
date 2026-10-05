@@ -22,10 +22,10 @@ recovery.
 2.  Kafka partitions events using `aircraft_id` as the message key.
 3.  Flink SQL reads the stream and applies event-time semantics.
 4.  A 5-second watermark tracks event-time progress.
-5.  Data-quality rules identify missing fields and overheated readings.
+5.  Data-quality rules identify missing fields. `engine_temp_c > 1000` stays in the detail table with `overheat = true`.
 6.  Late events are classified as accepted-late or too-late.
 7.  Valid events are deduplicated by `event_id`.
-8.  Clean and rejected records are committed to separate Iceberg tables.
+8.  The first valid copy is written to `aircraft_telemetry`, rejected rows go to `aircraft_telemetry_rejected`, and each closed event-time minute is written to `aircraft_telemetry_1m`.
 9.  Iceberg uses a REST catalog with Parquet data stored in MinIO.
 10. Spark reads the same Iceberg tables for validation, reconciliation,
     analysis, and maintenance.
@@ -65,7 +65,7 @@ Valid reading, first occurrence of `aviation.aircraft_telemetry`
 Same `event_id` seen again within rejected with `reason = duplicate`
 the 1-hour state TTL
 
-`engine_temp > 1000` rejected with `reason = overheat`
+`engine_temp_c > 1000` stays in `aircraft_telemetry` with `overheat = true`
 
 Event time is more than 15 seconds rejected with `reason = too_late`
 behind the current watermark
@@ -73,7 +73,7 @@ behind the current watermark
 Event is behind the watermark but main table with `late = true`
 within the 15-second tolerance
 
-Blank `event_id`, missing aircraft, rejected with the corresponding
+Blank `event_id`, missing aircraft, missing flight, rejected with the corresponding
 event time, or engine temperature reason
 
 ---
@@ -82,7 +82,7 @@ Multiple validation failures can be preserved on the same row, for
 example:
 
 ```text
-overheat,too_late
+blank_event_id,missing_engine_temp
 ```
 
 Rejected records retain:
@@ -134,6 +134,29 @@ data.
 
 `table.exec.source.idle-timeout = '10 s'` prevents an idle Kafka
 partition from indefinitely holding back the overall watermark.
+
+An event can also be out of order without being late. If its
+`event_time` is earlier than an event already seen, but still greater
+than or equal to the watermark, `late` stays false. That is the
+5-second out-of-orderness bound.
+
+## One-minute windows
+
+`aircraft_telemetry_1m` is one row per `aircraft_id`, `flight_id`, and
+event-time minute. The row is emitted when the watermark reaches
+`window_end`, and it is not updated after that.
+
+Measured with `python tests/test_semantics.py` on Flink 1.19:
+
+| Case | Detail table | 1-minute aggregate |
+|---|---|---|
+| Out of order, still at or after the watermark | `late = false` | counted while the minute is open |
+| Behind the watermark by at most 15 seconds, minute not yet closed | `late = true` | counted, and included in `late_count` |
+| More than 15 seconds behind the watermark | `reason = too_late` | absent |
+| Same lateness, but the minute has already closed | `late = true` | the closed row does not change |
+
+A behind-watermark row can still enter an open minute. It cannot revise
+a minute whose watermark has already passed `window_end`.
 
 ## Stateful deduplication
 
@@ -210,14 +233,25 @@ Example telemetry event:
 {
   "event_id": "7c2e0d2a-4f1b-4c0a-9a11-0b5e2d8c6f10",
   "aircraft_id": "AC-101",
-  "timestamp": "2026-09-26T06:43:24.565Z",
-  "telemetry": {
-    "altitude": 10821.4,
-    "speed": 854.2,
-    "engine_temp": 688.1
-  }
+  "flight_id": "AC-101-20261005-01",
+  "event_time": "2026-10-05T08:15:00.000Z",
+  "latitude": 32.947,
+  "longitude": 120.752,
+  "altitude_ft": 30276,
+  "ground_speed_kts": 393,
+  "vertical_speed_fpm": 2577,
+  "heading_deg": 342.1,
+  "engine_temp_c": 790,
+  "oil_pressure_psi": 55.1,
+  "fuel_flow_kg_h": 3100,
+  "fuel_remaining_kg": 16142,
+  "outside_air_temp_c": -44.9
 }
 ```
+
+`aircraft_id` and `flight_id` are the join keys for a later analytics project. This repository does not build flight, aircraft, airport, or weather tables.
+
+Changing units and column names does not fit in place on the old demo tables. `migrate_iceberg_v2.ps1` drops `aircraft_telemetry` and `aircraft_telemetry_rejected` on purpose. Normal `submit_flink_job.ps1` only creates missing tables. It does not drop them, and it refuses to start a second job of the same name.
 
 `event_time` comes from the JSON `timestamp` field.
 
@@ -389,6 +423,14 @@ same name and submits a fresh one. It does not restore a savepoint, so
 state such as deduplication starts fresh.
 
 ## Test scenarios
+
+```powershell
+python tests/test_semantics.py
+```
+
+That check generates one correlated flight locally, then sends a scripted
+Kafka sequence and compares the detail table, the reject table, and
+`aircraft_telemetry_1m`.
 
 Send controlled events one at a time:
 

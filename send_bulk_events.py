@@ -23,21 +23,34 @@ from datetime import datetime, timedelta, timezone
 from kafka import KafkaProducer
 from kafka.partitioner.default import DefaultPartitioner
 
+from telemetry_event import iso_z, message
+
 TOPIC = "aircraft-telemetry"
 # murmur2 % 3 for a 3-partition topic: AC-101 -> 0, AC-103 -> 1, AC-201 -> 2.
 ROUTING_KEYS = (b"AC-101", b"AC-103", b"AC-201")
 EVENT_LEAD = timedelta(minutes=2)
 
-NORMAL_TELEMETRY = {"altitude": 10800, "speed": 860, "engine_temp": 690}
-OVERHEAT_TELEMETRY = {"altitude": 12000, "speed": 820, "engine_temp": 1100}
-BLANK_TELEMETRY = {"altitude": 10000, "speed": 800, "engine_temp": 640}
-MISSING_TEMP_TELEMETRY = {"altitude": 10300, "speed": 770, "engine_temp": None}
-MISSING_AIRCRAFT_TELEMETRY = {"altitude": 10100, "speed": 790, "engine_temp": 630}
-MISSING_TIME_TELEMETRY = {"altitude": 10200, "speed": 780, "engine_temp": 620}
-
-
-def iso_z(moment: datetime) -> str:
-    return moment.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+def _bulk_row(
+    event_id: str | None,
+    aircraft_id: str | None,
+    flight_id: str | None,
+    stamp: datetime | None,
+    *,
+    altitude_ft: float,
+    ground_speed_kts: float,
+    engine_temp_c: float | None,
+) -> dict:
+    return message(
+        event_id,
+        aircraft_id,
+        flight_id,
+        stamp,
+        altitude_ft=altitude_ft,
+        ground_speed_kts=ground_speed_kts,
+        engine_temp_c=engine_temp_c,
+        vertical_speed_fpm=0,
+        fuel_flow_kg_h=2400 if (engine_temp_c or 0) <= 1000 else 3300,
+    )
 
 
 def mix_for(count: int) -> dict[str, int]:
@@ -76,61 +89,88 @@ def mix_for(count: int) -> dict[str, int]:
     return mix
 
 
-def _record(
-    event_id: str | None,
-    aircraft_id: str | None,
-    timestamp: str | None,
-    telemetry: dict,
-) -> dict:
-    return {
-        "event_id": event_id,
-        "aircraft_id": aircraft_id,
-        "timestamp": timestamp,
-        "telemetry": telemetry,
-    }
-
-
-def iter_primary(token: str, stamp: str, mix: dict[str, int]):
+def iter_primary(token: str, stamp: datetime, mix: dict[str, int]):
     """First wave. Originals are acknowledged before any duplicate is sent."""
     aircraft_id = f"ACB{token}"
+    flight_id = f"{aircraft_id}-LEG01"
     prefix = f"BULK-{token}"
 
     for index in range(mix["normal"]):
-        yield ROUTING_KEYS[index % 3], _record(
-            f"{prefix}-N-{index:06d}", aircraft_id, stamp, NORMAL_TELEMETRY
+        yield ROUTING_KEYS[index % 3], _bulk_row(
+            f"{prefix}-N-{index:06d}",
+            aircraft_id,
+            flight_id,
+            stamp,
+            altitude_ft=35000,
+            ground_speed_kts=455,
+            engine_temp_c=680,
         )
     for index in range(mix["overheat"]):
-        yield ROUTING_KEYS[index % 3], _record(
-            f"{prefix}-H-{index:06d}", aircraft_id, stamp, OVERHEAT_TELEMETRY
+        yield ROUTING_KEYS[index % 3], _bulk_row(
+            f"{prefix}-H-{index:06d}",
+            aircraft_id,
+            flight_id,
+            stamp,
+            altitude_ft=18000,
+            ground_speed_kts=320,
+            engine_temp_c=1100,
         )
     for index in range(mix["blank_event_id"]):
-        yield ROUTING_KEYS[index % 3], _record(
-            "", aircraft_id, stamp, BLANK_TELEMETRY
+        yield ROUTING_KEYS[index % 3], _bulk_row(
+            "",
+            aircraft_id,
+            flight_id,
+            stamp,
+            altitude_ft=10000,
+            ground_speed_kts=220,
+            engine_temp_c=640,
         )
     for index in range(mix["missing_aircraft_id"]):
-        yield ROUTING_KEYS[index % 3], _record(
-            f"{prefix}-NOAC-{index:06d}", None, stamp, MISSING_AIRCRAFT_TELEMETRY
+        yield ROUTING_KEYS[index % 3], _bulk_row(
+            f"{prefix}-NOAC-{index:06d}",
+            None,
+            flight_id,
+            stamp,
+            altitude_ft=10100,
+            ground_speed_kts=210,
+            engine_temp_c=630,
         )
     for index in range(mix["missing_event_time"]):
-        yield ROUTING_KEYS[index % 3], _record(
-            f"{prefix}-NOTS-{index:06d}", aircraft_id, None, MISSING_TIME_TELEMETRY
+        yield ROUTING_KEYS[index % 3], _bulk_row(
+            f"{prefix}-NOTS-{index:06d}",
+            aircraft_id,
+            flight_id,
+            None,
+            altitude_ft=10200,
+            ground_speed_kts=200,
+            engine_temp_c=620,
         )
     for index in range(mix["missing_engine_temp"]):
-        yield ROUTING_KEYS[index % 3], _record(
+        yield ROUTING_KEYS[index % 3], _bulk_row(
             f"{prefix}-NOTEMP-{index:06d}",
             aircraft_id,
+            flight_id,
             stamp,
-            MISSING_TEMP_TELEMETRY,
+            altitude_ft=10300,
+            ground_speed_kts=190,
+            engine_temp_c=None,
         )
 
 
-def iter_duplicates(token: str, stamp: str, mix: dict[str, int]):
+def iter_duplicates(token: str, stamp: datetime, mix: dict[str, int]):
     """Second copies of the first normal event ids. Same key as the original."""
     aircraft_id = f"ACB{token}"
+    flight_id = f"{aircraft_id}-LEG01"
     prefix = f"BULK-{token}"
     for index in range(mix["duplicate"]):
-        yield ROUTING_KEYS[index % 3], _record(
-            f"{prefix}-N-{index:06d}", aircraft_id, stamp, NORMAL_TELEMETRY
+        yield ROUTING_KEYS[index % 3], _bulk_row(
+            f"{prefix}-N-{index:06d}",
+            aircraft_id,
+            flight_id,
+            stamp,
+            altitude_ft=35000,
+            ground_speed_kts=455,
+            engine_temp_c=680,
         )
 
 
@@ -155,7 +195,7 @@ def _produce(producer: KafkaProducer, records, total: int, sent: int) -> int:
 def send_bulk(bootstrap: str, count: int) -> None:
     token = uuid.uuid4().hex[:6]
     mix = mix_for(count)
-    stamp = iso_z(datetime.now(timezone.utc) + EVENT_LEAD)
+    stamp = datetime.now(timezone.utc) + EVENT_LEAD
     producer = KafkaProducer(
         bootstrap_servers=bootstrap,
         value_serializer=lambda value: json.dumps(value).encode("utf-8"),
@@ -210,7 +250,7 @@ def _print_report(token: str, stamp: str, mix: dict[str, int], elapsed: float) -
         f"\nbatch {token}  aircraft_id=ACB{token}  "
         f"messages={main_rows + rejected_rows}  elapsed={elapsed:.1f}s"
     )
-    print(f"event_time={stamp}")
+    print(f"event_time={iso_z(stamp)}")
     print(f"\nExpect in aviation.aircraft_telemetry ({main_rows} rows):")
     print(f"  normal     {mix['normal']:<6} overheat=false  late=false")
     print(f"  overheat   {mix['overheat']:<6} overheat=true   late=false")
